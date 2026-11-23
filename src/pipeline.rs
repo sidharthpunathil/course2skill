@@ -240,9 +240,24 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                 }
                 let Some(engine) = asr.as_mut() else { continue };
                 let cache = cache_base(&opts.cache, &course.root, video, &opts.asr_model);
+                let mut done_secs = 0.0;
                 if let Err(e) = transcribe_video(
-                    engine, idx, video, &cache, &target, &context, opts, tx, stop,
+                    engine,
+                    idx,
+                    video,
+                    &cache,
+                    &target,
+                    &context,
+                    opts,
+                    tx,
+                    stop,
+                    &mut done_secs,
                 ) {
+                    // Take the rest of this video out of the progress total.
+                    let total = media::probe_duration(video).unwrap_or(done_secs);
+                    send(Event::SkippedAudio {
+                        secs: (total - done_secs).max(0.0),
+                    });
                     failed.insert(idx);
                     send(Event::Error(format!("{}: {e:#}", file_name(video))));
                     // The worker may have died; start a fresh one for the next video.
@@ -369,6 +384,7 @@ fn transcribe_video(
     opts: &Opts,
     tx: &Sender<Event>,
     stop: &AtomicBool,
+    done_secs: &mut f64,
 ) -> Result<()> {
     if let Some(dir) = cache_base.parent() {
         std::fs::create_dir_all(dir)?;
@@ -413,6 +429,7 @@ fn transcribe_video(
                 (p, false)
             }
         };
+        *done_secs += span.len();
         let _ = tx.send(Event::Chunk {
             done: i + 1,
             total: spans.len(),

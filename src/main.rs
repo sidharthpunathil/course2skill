@@ -86,6 +86,9 @@ struct AiArgs {
     /// Base URL for API and local backends (e.g. http://localhost:1234/v1 for LM Studio)
     #[arg(long)]
     ai_url: Option<String>,
+    /// Minutes before a stuck AI call is stopped
+    #[arg(long, default_value_t = 60)]
+    skill_timeout: u64,
 }
 
 #[derive(Args, Clone)]
@@ -132,6 +135,7 @@ impl AiArgs {
             backend: self.ai,
             model: self.ai_model.clone(),
             base_url: self.ai_url.clone(),
+            timeout: std::time::Duration::from_secs(self.skill_timeout.max(1) * 60),
         }
     }
 }
@@ -432,6 +436,7 @@ fn wizard_flow() -> Result<bool> {
             ai: choice.ai.backend,
             ai_model: choice.ai.model.clone(),
             ai_url: choice.ai.base_url.clone(),
+            skill_timeout: choice.ai.timeout.as_secs() / 60,
         },
         asr: AsrArgs {
             venv: None,

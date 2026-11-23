@@ -42,6 +42,10 @@ struct App {
     logs: VecDeque<(bool, String)>,
     started: Instant,
     asr_started: Option<Instant>,
+    /// When the last chunk (or video start) arrived.
+    last_chunk_at: Option<Instant>,
+    /// Wall time spent producing fresh (not cached) chunks.
+    fresh_elapsed: f64,
     finished: Option<(bool, String)>,
     tick: usize,
 }
@@ -64,6 +68,8 @@ impl App {
             logs: VecDeque::new(),
             started: Instant::now(),
             asr_started: None,
+            last_chunk_at: None,
+            fresh_elapsed: 0.0,
             finished: None,
             tick: 0,
         }
@@ -104,6 +110,7 @@ impl App {
                 self.chunk = (0, chunks);
                 self.transcript.clear();
                 self.asr_started.get_or_insert_with(Instant::now);
+                self.last_chunk_at = Some(Instant::now());
             }
             Event::Chunk {
                 done,
@@ -115,9 +122,14 @@ impl App {
             } => {
                 self.chunk = (done, total);
                 self.done_audio += audio_secs;
+                let now = Instant::now();
                 if !cached {
                     self.fresh_audio += audio_secs;
+                    self.fresh_elapsed += self
+                        .last_chunk_at
+                        .map_or(0.0, |t| now.duration_since(t).as_secs_f64());
                 }
+                self.last_chunk_at = Some(now);
                 if !text.is_empty() {
                     self.transcript.push_back((start, text));
                     while self.transcript.len() > 40 {
@@ -147,15 +159,16 @@ impl App {
         }
     }
 
+    /// Audio seconds transcribed per wall second, counting only fresh work
+    /// (cached chunks replay instantly and would inflate or skew it).
+    fn speed(&self) -> Option<f64> {
+        (self.fresh_audio >= 30.0 && self.fresh_elapsed >= 5.0)
+            .then(|| self.fresh_audio / self.fresh_elapsed)
+    }
+
     fn eta(&self) -> Option<Duration> {
-        let started = self.asr_started?;
-        let elapsed = started.elapsed().as_secs_f64();
-        if self.fresh_audio < 30.0 || elapsed < 5.0 {
-            return None;
-        }
-        let speed = self.fresh_audio / elapsed;
         let left = (self.total_audio - self.done_audio).max(0.0);
-        Some(Duration::from_secs_f64(left / speed))
+        Some(Duration::from_secs_f64(left / self.speed()?))
     }
 }
 
@@ -271,11 +284,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
     let eta = app
         .eta()
         .map_or_else(|| "estimating…".to_string(), |d| fmt_ts(d.as_secs_f64()));
-    let speed = app
-        .asr_started
-        .map(|s| s.elapsed().as_secs_f64())
-        .filter(|e| *e > 1.0)
-        .map_or(0.0, |e| app.fresh_audio / e);
+    let speed = app.speed().unwrap_or(0.0);
     let stats = Line::from(vec![
         stat(
             "audio",

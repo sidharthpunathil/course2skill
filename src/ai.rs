@@ -54,7 +54,11 @@ pub struct AiConfig {
     pub model: Option<String>,
     /// Overrides the base URL for API and local backends.
     pub base_url: Option<String>,
+    /// An agent CLI still running after this long is stopped.
+    pub timeout: Duration,
 }
+
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 impl Backend {
     pub fn label(self) -> &'static str {
@@ -272,6 +276,16 @@ fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<Stri
         .with_context(|| format!("could not start `{bin}`"))?;
     let pid = child.id();
     track(pid, true);
+    let timeout = cfg.timeout;
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        // Still registered means still running: stop its whole process group.
+        if CHILDREN.lock().is_ok_and(|c| c.contains(&pid)) {
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status();
+        }
+    });
     if via_stdin && let Some(mut stdin) = child.stdin.take() {
         // Write from a thread so a large prompt cannot deadlock against a full stdout pipe.
         let prompt = prompt.to_string();
@@ -279,9 +293,16 @@ fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<Stri
             let _ = stdin.write_all(prompt.as_bytes());
         });
     }
+    let started = std::time::Instant::now();
     let out = child.wait_with_output();
     track(pid, false);
     let out = out?;
+    if !out.status.success() && started.elapsed() >= timeout {
+        bail!(
+            "{bin} was stopped after {} minutes (raise --skill-timeout)",
+            timeout.as_secs() / 60
+        );
+    }
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);

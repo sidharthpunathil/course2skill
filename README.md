@@ -71,6 +71,7 @@ Useful flags:
 | `--units 1,3-5` | Only some units |
 | `--run latest\|NAME` | Continue a specific run |
 | `--new` | Start a new run even if the latest one did not finish |
+| `--skill-timeout MIN` | Stop an AI call that runs longer than this (default 60) |
 | `--language NAME` | Spoken language (default `English`, `auto` to detect) |
 | `--asr-model Qwen/Qwen3-ASR-0.6B` | Faster, slightly less accurate speech model |
 | `--plain` | Log lines instead of the TUI |

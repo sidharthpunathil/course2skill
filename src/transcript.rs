@@ -81,59 +81,85 @@ pub fn fmt_ts(secs: f64) -> String {
 pub fn sentences(pieces: &[Piece]) -> Vec<Sentence> {
     let mut out = Vec::new();
     for p in pieces.iter().filter(|p| !p.text.trim().is_empty()) {
-        if p.words.is_empty() {
-            out.push(Sentence {
-                start: p.start,
-                end: p.end,
-                text: p.text.trim().to_string(),
-            });
-            continue;
-        }
-        let mut wi = 0;
+        let tokens: Vec<&str> = p.text.split_whitespace().collect();
+        let times = token_times(p, &tokens);
+        let mut first: Option<usize> = None;
         let mut cur = String::new();
-        let mut cur_start: Option<f64> = None;
-        let mut cur_end = p.start;
-        for token in p.text.split_whitespace() {
-            let norm = normalize(token);
-            // Advance to the aligned word that matches this token (aligners may split or skip).
-            let mut matched = None;
-            for (k, w) in p.words.iter().enumerate().skip(wi).take(4) {
-                if !norm.is_empty() && normalize(&w.text) == norm {
-                    matched = Some(k);
-                    break;
-                }
-            }
-            if let Some(k) = matched {
-                cur_start.get_or_insert(p.words[k].start);
-                cur_end = p.words[k].end;
-                wi = k + 1;
-            } else if cur_start.is_none() {
-                // No aligned word for this token: use the next unused word, or the
-                // last matched time when the chunk's words are used up.
-                cur_start = Some(p.words.get(wi).map_or(cur_end, |w| w.start));
-            }
+        for (i, token) in tokens.iter().enumerate() {
+            first.get_or_insert(i);
             if !cur.is_empty() {
                 cur.push(' ');
             }
             cur.push_str(token);
-            if token.ends_with(['.', '?', '!']) {
+            let last_token = i + 1 == tokens.len();
+            if token.ends_with(['.', '?', '!']) || last_token {
+                let f = first.take().unwrap_or(i);
                 out.push(Sentence {
-                    start: cur_start.unwrap_or(p.start),
-                    end: cur_end,
+                    start: times[f].0,
+                    end: times[i].1,
                     text: std::mem::take(&mut cur),
                 });
-                cur_start = None;
             }
-        }
-        if !cur.is_empty() {
-            out.push(Sentence {
-                start: cur_start.unwrap_or(p.start),
-                end: cur_end.max(p.end),
-                text: cur,
-            });
         }
     }
     out
+}
+
+/// Start and end time for every token of the chunk text. Tokens are matched to
+/// the aligner's words with a longest-common-subsequence alignment, so a word
+/// the aligner dropped or split does not shift the rest. Unmatched tokens take
+/// the time of the nearest matched word before them (or after, at the start).
+fn token_times(p: &Piece, tokens: &[&str]) -> Vec<(f64, f64)> {
+    let a: Vec<String> = tokens.iter().map(|t| normalize(t)).collect();
+    let b: Vec<String> = p.words.iter().map(|w| normalize(&w.text)).collect();
+    let (n, m) = (a.len(), b.len());
+    // lcs[i][j] = LCS length of a[i..] and b[j..].
+    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if !a[i].is_empty() && a[i] == b[j] {
+                lcs[i + 1][j + 1] + 1
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let mut matched: Vec<Option<usize>> = vec![None; n];
+    let (mut i, mut j) = (0, 0);
+    while i < n && j < m {
+        if !a[i].is_empty() && a[i] == b[j] {
+            matched[i] = Some(j);
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    let mut times: Vec<Option<(f64, f64)>> = matched
+        .iter()
+        .map(|m| m.map(|k| (p.words[k].start, p.words[k].end)))
+        .collect();
+    // Fill gaps: carry the previous matched end forward, then the next start backward.
+    let mut prev: Option<f64> = None;
+    for t in &mut times {
+        match t {
+            Some((_, e)) => prev = Some(*e),
+            None => *t = prev.map(|e| (e, e)),
+        }
+    }
+    let mut next: Option<f64> = None;
+    for t in times.iter_mut().rev() {
+        match t {
+            Some((s, _)) => next = Some(*s),
+            None => *t = next.map(|s| (s, s)),
+        }
+    }
+    times
+        .into_iter()
+        .map(|t| t.unwrap_or((p.start, p.start)))
+        .collect()
 }
 
 fn normalize(s: &str) -> String {
@@ -219,6 +245,38 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert_eq!(s[0].text, "Hello world.");
         assert!((s[1].start - 104.2).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dropped_common_word_does_not_shift_later_sentences() {
+        // The aligner dropped the first "the"; greedy lookahead would match the later one.
+        let p = Piece {
+            start: 0.0,
+            end: 20.0,
+            text: "Open the tool. Then the menu.".into(),
+            words: vec![
+                w("Open", 1.0),
+                w("tool", 2.0),
+                w("Then", 10.0),
+                w("the", 10.5),
+                w("menu", 11.0),
+            ],
+        };
+        let s = sentences(&[p]);
+        assert_eq!(s.len(), 2);
+        assert!((s[0].start - 1.0).abs() < 1e-9);
+        assert!((s[1].start - 10.0).abs() < 1e-9, "{:?}", s[1]);
+    }
+
+    #[test]
+    fn sentences_without_words_use_chunk_start() {
+        let p = Piece {
+            start: 30.0,
+            end: 40.0,
+            text: "No timing here.".into(),
+            words: vec![],
+        };
+        assert!((sentences(&[p])[0].start - 30.0).abs() < 1e-9);
     }
 
     #[test]

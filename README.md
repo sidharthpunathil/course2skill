@@ -82,6 +82,16 @@ Useful flags:
 
 Press `q` to stop the TUI. Running agent CLIs are stopped too. Finished chunks are cached and the run folder is kept, so running the same command again picks up where it stopped.
 
+## Share or install the skills
+
+```sh
+course2skill export --to ~/Desktop/share              # the whole package for a friend or another agent
+course2skill export --to ~/Desktop/share --zip        # plus one zip per skill and one for the course
+course2skill export --to ~/.claude/skills --flat      # install the skills straight into Claude Code
+```
+
+An export holds `skills/` (each skill a self-contained folder), `course/` (transcripts and course files, leave out with `--skills-only`), `knowledge-graph/` and a `README.md` index with install steps. It exports the latest run unless you pass `--run`. Local paths are replaced with neutral placeholders, internal marker files are left out, and `scripts/frame.sh` reads the video location from `COURSE_VIDEO_DIR`, so the receiver can still grab frames if they have the course videos.
+
 ## Course layouts
 
 course2skill finds videos and handouts at any depth. With `--layout auto` (the default):

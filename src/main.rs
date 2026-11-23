@@ -4,6 +4,7 @@ mod ai;
 mod asr;
 mod chunk;
 mod docs;
+mod export;
 mod graph;
 mod layout;
 mod media;
@@ -48,6 +49,8 @@ enum Cmd {
     Skills(RunArgs),
     /// Show how the course will be grouped into units, and save plan.json
     Plan(RunArgs),
+    /// Copy finished skills (and the course content and graph) somewhere to share or install
+    Export(ExportArgs),
     /// Save one frame of a video: course2skill frame <video> <mm:ss> <out.jpg>
     Frame {
         video: PathBuf,
@@ -58,6 +61,31 @@ enum Cmd {
     Setup(AsrArgs),
     /// Check tools, AI backends and the speech-to-text environment
     Doctor(AsrArgs),
+}
+
+#[derive(Args, Clone)]
+struct ExportArgs {
+    /// Where to put the export
+    #[arg(long)]
+    to: PathBuf,
+    /// Base output folder the runs live in
+    #[arg(long, default_value = "result")]
+    out: PathBuf,
+    /// Which run to export ("latest" or a run folder name)
+    #[arg(long, default_value = "latest")]
+    run: String,
+    /// Put skill folders directly in --to (e.g. --to ~/.claude/skills --flat)
+    #[arg(long)]
+    flat: bool,
+    /// Also make one zip per skill and one for the whole course
+    #[arg(long)]
+    zip: bool,
+    /// Leave out the course transcripts and files
+    #[arg(long)]
+    skills_only: bool,
+    /// Replace skills that already exist at the destination
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Args, Clone)]
@@ -382,6 +410,31 @@ fn run_pipeline(
     Ok(finished.unwrap_or(false))
 }
 
+fn run_export(a: &ExportArgs) -> Result<bool> {
+    let base = out_dir(&a.out)?;
+    let run = runs::resolve(&base, &a.run)?;
+    std::fs::create_dir_all(&a.to)?;
+    let s = export::export(&export::ExportOpts {
+        run,
+        to: a.to.canonicalize()?,
+        flat: a.flat,
+        zip: a.zip,
+        skills_only: a.skills_only,
+        force: a.force,
+    })?;
+    println!("exported {} skills to {}", s.skills.len(), s.dest.display());
+    for sk in &s.skills {
+        println!("  ✔ {sk}");
+    }
+    for sk in &s.incomplete {
+        println!("  · {sk} (not finished in this run, skipped)");
+    }
+    for z in &s.zips {
+        println!("  zip {}", z.display());
+    }
+    Ok(s.incomplete.is_empty())
+}
+
 fn doctor(a: &AsrArgs) -> Result<bool> {
     let mut ok = true;
     println!("tools");
@@ -469,6 +522,7 @@ fn main() -> ExitCode {
             print_plan(&p);
             true
         }),
+        Some(Cmd::Export(a)) => run_export(&a),
         Some(Cmd::Frame { video, at, out }) => media::parse_ts(&at)
             .and_then(|t| media::frame(&video, t, &out))
             .map(|()| true),

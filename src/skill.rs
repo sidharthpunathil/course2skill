@@ -129,9 +129,18 @@ pub fn text_prompt(
 }
 
 fn sources_md(chapter: &Chapter, m: &Material) -> String {
-    let mut md = format!("# Sources for {}\n\n## Videos\n\nScreenshot names start with the video number below (`v1-...`).\n\n", chapter.name);
+    let mut md = format!(
+        "# Sources for {}\n\n## Videos\n\nScreenshot names start with the video number below (`v1-...`).\n\n",
+        chapter.name
+    );
     for (i, v) in chapter.videos.iter().enumerate() {
-        let _ = writeln!(md, "- v{}: `{}` (full path: `{}`)", i + 1, file_name(v), v.display());
+        let _ = writeln!(
+            md,
+            "- v{}: `{}` (full path: `{}`)",
+            i + 1,
+            file_name(v),
+            v.display()
+        );
     }
     md.push_str("\n## Transcripts\n\n");
     for t in &m.transcripts {

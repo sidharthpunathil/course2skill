@@ -58,7 +58,7 @@ pub struct AiConfig {
     pub timeout: Duration,
 }
 
-pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90 * 60);
 
 impl Backend {
     pub fn label(self) -> &'static str {

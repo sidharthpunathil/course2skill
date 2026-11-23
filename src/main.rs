@@ -88,7 +88,7 @@ struct AiArgs {
     #[arg(long)]
     ai_url: Option<String>,
     /// Minutes before a stuck AI call is stopped
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 90)]
     skill_timeout: u64,
 }
 

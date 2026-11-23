@@ -14,8 +14,10 @@ result/
       01-Welcome to Compact Keywords.pdf        course files copied as-is
     skills/
       01-introduction/         one skill per section
-        SKILL.md               the playbook, with screenshots embedded
-        references/*.md        templates, walkthroughs, checklists, glossary
+        SKILL.md               the playbook: principles, procedures, thresholds, checklists,
+                               mistakes, tips and tricks, examples, glossary, screenshots
+        references/lessons/    complete ordered notes for every video, with timestamps
+        references/*.md        templates, walkthroughs, resources.md, coverage.md
         assets/screenshots/    frames the AI picked from the videos and checked
         assets/files/          the section's course files, as-is
         sources.md             every video, transcript and file
@@ -73,7 +75,7 @@ Useful flags:
 | `--units 1,3-5` | Only some units |
 | `--run latest\|NAME` | Continue a specific run |
 | `--new` | Start a new run even if the latest one did not finish |
-| `--skill-timeout MIN` | Stop an AI call that runs longer than this (default 60) |
+| `--skill-timeout MIN` | Stop an AI call that runs longer than this (default 90) |
 | `--language NAME` | Spoken language (default `English`, `auto` to detect) |
 | `--asr-model Qwen/Qwen3-ASR-0.6B` | Faster, slightly less accurate speech model |
 | `--plain` | Log lines instead of the TUI |
@@ -113,6 +115,10 @@ The coding CLIs work in the skill folder with copies of the transcripts and the 
 4. Each piece is cached as soon as it finishes. The transcript is written once the whole video is done, with the time of the first word at the start of every sentence.
 
 On an M-series Mac the 1.7B model runs at roughly 0.15 to 0.2 times real time, so a 10-hour course takes about 2 hours.
+
+## What goes into a skill
+
+The skill writer works in a fixed order: read every transcript and course file in full, capture screenshots, write complete lesson notes for every video (every step, number, tool, setting, example, warning, opinion, tip, trick, shortcut, aside and resource, in order with timestamps), then write `SKILL.md` as a playbook another LLM can act on, plus topic references and `references/resources.md`. Last, it re-reads every transcript and file to check each detail made it in, adds what is missing, and records the result in `references/coverage.md`.
 
 ## Screenshots
 

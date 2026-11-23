@@ -38,6 +38,8 @@ pub const COMPLETE: &str = ".complete";
 pub struct Material {
     /// Transcript markdown, one per video.
     pub transcripts: Vec<PathBuf>,
+    /// Visual index markdown per video: (file name, content).
+    pub visual: Vec<(String, String)>,
     /// Course files copied as-is (PDFs, spreadsheets, images, ...).
     pub files: Vec<PathBuf>,
 }
@@ -55,14 +57,18 @@ pub fn chapter_material(chapter: &Chapter, result_chapter_dir: &Path) -> Materia
         .map(|n| result_chapter_dir.join(n))
         .filter(|p| p.is_file())
         .collect();
-    Material { transcripts, files }
+    Material {
+        transcripts,
+        visual: Vec::new(),
+        files,
+    }
 }
 
 const MANIFEST: &str = "assets/screenshots.tsv";
 
-const AGENT_SCREENSHOTS: &str = "Take as many screenshots as the section needs for the best understanding and the most accurate, useful skill. There is no limit. Capture every moment where the screen carries information the words do not, and for on-screen walkthroughs capture each step (every screen, menu, setting, field and result shown), not just the first and last. Run `scripts/frame.sh \"<video file>\" <mm:ss> <name>.jpg` for each moment. Name every screenshot so the file name alone says where it is from and what it shows: `v<video number>-<mm>m<ss>s-<tool or place>-<what it shows>.jpg`, lowercase, words joined by hyphens, under 90 characters, for example `v2-09m12s-google-search-console-pages-report-not-indexed-reasons.jpg`. The video number is the one in `sources.md`. Use the same convention in the alt text, written out in plain words. It saves the frame into `assets/screenshots/` and prints the path. Open every screenshot you take and check that it shows what you need, and read any text in it (numbers, labels, settings, column headers) into the notes, because the reader may not be able to view images. If a frame caught a transition, the wrong screen or the presenter's face, try a few seconds earlier or later, or grab a short range with `scripts/frame.sh \"<video file>\" <from> <to> 2` to find the clearest moment, then capture that moment again with its proper name (range frames have automatic names and are removed if not embedded). When the screen changes during a long explanation, take a frame for each distinct state. Embed every screenshot that helps; ones you do not embed are removed automatically afterwards. If you cannot run commands, list each screenshot you want in `assets/screenshots.tsv` instead, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`; they are captured after you finish.";
+const AGENT_SCREENSHOTS: &str = "Work from the timestamps. Each video has a visual index (listed in your inputs) with every moment the picture changes and every sentence where the speaker points at something on screen, each with its time and what is being said. Go through the index together with the transcript and capture a frame at every moment that shows useful information: one or two seconds after a scene change, or one to two seconds after a spoken cue starts. Also capture any other moment the transcript tells you something is on screen. There is no limit: take as many as the section needs, and for on-screen walkthroughs capture each step. Run `scripts/frame.sh \"<video file>\" <mm:ss> <name>.jpg` for each moment. If you need to know more about a moment (the frame caught a transition, or you are not sure what was on screen), check the video around that time with a short range, `scripts/frame.sh \"<video file>\" <a few seconds before> <a few seconds after> 1`, find the clearest frame, and capture that moment again with its proper name (range frames have automatic names and are removed if not embedded). Do not sweep whole videos at fixed intervals. Name every screenshot so the file name alone says where it is from and what it shows: `v<video number>-<mm>m<ss>s-<tool or place>-<what it shows>.jpg`, lowercase, words joined by hyphens, under 90 characters, for example `v2-09m12s-google-search-console-pages-report-not-indexed-reasons.jpg`. The video number is the one in `sources.md`. Open every screenshot you keep and read any text in it (numbers, labels, settings, column headers) into the notes, because the reader may not be able to view images. Embed every screenshot that helps; ones you do not embed are removed automatically afterwards. If you cannot run commands, list each screenshot you want in `assets/screenshots.tsv` instead, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`; they are captured after you finish.";
 
-const TEXT_SCREENSHOTS: &str = "You cannot watch the video, so choose every moment in the transcripts where the screen most likely shows something useful (a tool, a setting, a report, a page, a spreadsheet, each step of a walkthrough). There is no limit: request as many as the section needs. The sentence is spoken while the thing is on screen, so pick a time one or two seconds after the sentence starts. Name each one `v<video number>-<mm>m<ss>s-<tool or place>-<what it shows>.jpg` (lowercase, hyphens, under 90 characters, video number as listed in the inputs order), for example `v2-09m12s-google-search-console-pages-report.jpg`. List them in a file block for `assets/screenshots.tsv`, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`. They are captured after you reply, so embed them in SKILL.md and the lesson notes by the names you chose.";
+const TEXT_SCREENSHOTS: &str = "You cannot watch the video, so work from the timestamps. Each video's visual index (in the material) lists every moment the picture changes and every sentence where the speaker points at something on screen, with what is said. Request a frame for every one of those moments that likely shows useful information (one or two seconds after the listed time), and for any other moment the transcript says something is on screen. There is no limit. Name each one `v<video number>-<mm>m<ss>s-<tool or place>-<what it shows>.jpg` (lowercase, hyphens, under 90 characters, video number as in the inputs order), for example `v2-09m12s-google-search-console-pages-report.jpg`. List them in a file block for `assets/screenshots.tsv`, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`. They are captured after you reply, so embed them in SKILL.md and the lesson notes by the names you chose.";
 
 fn fill(course: &str, chapter: &Chapter, inputs: &str, screenshots: &str, output: &str) -> String {
     PROMPT_TEMPLATE
@@ -82,6 +88,12 @@ pub fn agent_prompt(course: &str, chapter: &Chapter, m: &Material, as_text: &[St
     );
     for t in &m.transcripts {
         let _ = writeln!(inputs, "- `{STAGE}/transcripts/{}`", file_name(t));
+    }
+    if !m.visual.is_empty() {
+        inputs.push_str("\nVisual index per video (scene changes and spoken screen cues, with timestamps and what is said):\n");
+        for (n, _) in &m.visual {
+            let _ = writeln!(inputs, "- `{STAGE}/visual-index/{n}`");
+        }
     }
     if !m.files.is_empty() {
         inputs.push_str("\nCourse files (handouts, templates, slides, images), as the instructor shared them, already copied into the skill:\n");
@@ -179,8 +191,10 @@ pub fn synthesize(
     skills_root: &Path,
     ai_cfg: &AiConfig,
     graph: Option<&Path>,
+    cache: &Path,
 ) -> Result<(PathBuf, Vec<String>)> {
-    let m = chapter_material(chapter, result_chapter_dir);
+    let mut m = chapter_material(chapter, result_chapter_dir);
+    m.visual = visual_indexes(chapter, result_chapter_dir, cache);
     if m.transcripts.is_empty() && m.files.is_empty() {
         bail!("unit {} has no transcripts or files yet", chapter.name);
     }
@@ -233,6 +247,7 @@ pub fn synthesize(
         for t in &m.transcripts {
             inline.push((file_name(t), std::fs::read_to_string(t)?));
         }
+        inline.extend(m.visual.iter().cloned());
         inline.extend(texts.iter().cloned());
         let unreadable: Vec<String> = m
             .files
@@ -271,6 +286,30 @@ pub fn synthesize(
     clean_tree(&skill_dir)?;
     std::fs::write(skill_dir.join(COMPLETE), "")?;
     Ok((skill_dir, notes))
+}
+
+/// One visual index per video that has a transcript. Scene detection failures
+/// fall back to spoken cues only.
+fn visual_indexes(chapter: &Chapter, result_dir: &Path, cache: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (i, (video, name)) in chapter
+        .videos
+        .iter()
+        .zip(&chapter.transcript_names)
+        .enumerate()
+    {
+        let Ok(md) = std::fs::read_to_string(result_dir.join(format!("{name}.md"))) else {
+            continue;
+        };
+        let lines = crate::visual::transcript_lines(&md);
+        let scenes = crate::visual::cached_scenes(cache, video).unwrap_or_default();
+        let moments = crate::visual::moments(&lines, &scenes);
+        out.push((
+            format!("{name}.md"),
+            crate::visual::render(&file_name(video), i + 1, &moments),
+        ));
+    }
+    out
 }
 
 /// Adds the knowledge-graph instructions after the inputs section.
@@ -384,6 +423,12 @@ fn stage_inputs(stage: &Path, m: &Material, texts: &[(String, String)]) -> Resul
     for t in &m.transcripts {
         std::fs::copy(t, stage.join("transcripts").join(file_name(t)))?;
     }
+    if !m.visual.is_empty() {
+        std::fs::create_dir_all(stage.join("visual-index"))?;
+        for (n, body) in &m.visual {
+            std::fs::write(stage.join("visual-index").join(n), body)?;
+        }
+    }
     if !texts.is_empty() {
         std::fs::create_dir_all(stage.join("files-as-text"))?;
         for (n, body) in texts {
@@ -450,6 +495,7 @@ mod tests {
     fn material() -> Material {
         Material {
             transcripts: vec!["/r/05/Video_01.md".into()],
+            visual: vec![("Video_01.md".into(), "idx".into())],
             files: vec!["/r/05/a.pdf".into()],
         }
     }
@@ -468,6 +514,8 @@ mod tests {
         assert!(p.contains("assets/files/a.pdf"));
         assert!(p.contains("scripts/frame.sh \"<video file>\" <mm:ss>"));
         assert!(p.contains(".input/files-as-text/a.pdf.md"));
+        assert!(p.contains(".input/visual-index/Video_01.md"));
+        assert!(p.contains("Work from the timestamps"));
         assert!(p.contains("scripts/frame.sh"));
         assert!(!p.contains("{{"));
     }

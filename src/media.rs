@@ -83,6 +83,28 @@ pub fn frame(video: &Path, at: f64, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Times (seconds) where the picture changes noticeably: cuts, slide changes,
+/// screen shares, overlays. Analyzed at 2 fps and low resolution for speed.
+pub fn scene_changes(video: &Path, threshold: f64) -> Result<Vec<f64>> {
+    let filter = format!("fps=2,scale=320:-2,select='gt(scene\\,{threshold})',showinfo");
+    let out = run(
+        Command::new("ffmpeg")
+            .args(["-nostdin", "-hide_banner", "-i"])
+            .arg(video)
+            .args(["-an", "-vf", &filter, "-f", "null", "-"]),
+        "ffmpeg (scene detection)",
+    )?;
+    Ok(parse_pts_times(&String::from_utf8_lossy(&out.stderr)))
+}
+
+fn parse_pts_times(stderr: &str) -> Vec<f64> {
+    stderr
+        .split("pts_time:")
+        .skip(1)
+        .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
+        .collect()
+}
+
 /// Parses `ss`, `mm:ss`, or `hh:mm:ss` (fractions allowed).
 pub fn parse_ts(s: &str) -> Result<f64> {
     let mut total = 0.0;
@@ -98,6 +120,12 @@ pub fn parse_ts(s: &str) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pts_times_parse_from_showinfo() {
+        let s = "[Parsed_showinfo_3 @ 0x1] n:0 pts:64 pts_time:32 duration:1\n[x] n:1 pts:91 pts_time:45.5 d";
+        assert_eq!(parse_pts_times(s), vec![32.0, 45.5]);
+    }
 
     #[test]
     fn parse_ts_handles_formats() {

@@ -15,7 +15,7 @@ Transcripts come from local speech recognition, so expect some misheard words, e
 Work in this order. Do not skip steps and do not sample: read everything in full.
 
 1. Inspect everything. Read every transcript completely, start to end, and open every course file (spreadsheets sheet by sheet, documents page by page).
-2. Find the visual moments. While reading, note each moment where what is on screen carries information the words do not: a tool's interface or settings, a report, a spreadsheet layout, a search results page, a page being built, a before/after, a chart, a slide. Phrases like "as you can see", "right here", "this page", "click on", "look at this" are strong signals.
+2. Find the visual moments from the timestamps. Read each video's visual index next to its transcript: it lists every scene change and every spoken screen cue ("as you can see", "click", "this page"...) with the time and what is said. Those, plus anything else the transcript says is on screen, are the moments where the picture may carry information the words do not: a tool's interface or settings, a report, a spreadsheet layout, a search results page, a page being built, a before/after, a chart, a slide.
 3. Capture screenshots. {{SCREENSHOTS}}
 4. Write the lesson notes (below) for every video, in order. This is where nothing gets lost.
 5. Write `SKILL.md` and the topic references from the notes, the course files and the screenshots.

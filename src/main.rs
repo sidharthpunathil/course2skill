@@ -13,6 +13,7 @@ mod runs;
 mod skill;
 mod transcript;
 mod tui;
+mod visual;
 mod wizard;
 
 use ai::{AiConfig, Backend};

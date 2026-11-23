@@ -301,6 +301,44 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         }
     }
 
+    // Scene changes for every video, 4 at a time, so skill writers never wait.
+    if do_skills && !stop.load(Ordering::Relaxed) {
+        let videos: Vec<&PathBuf> = selected
+            .iter()
+            .flat_map(|&i| &course.chapters[i].videos)
+            .collect();
+        send(Event::Stage(format!(
+            "Finding screen changes in {} videos",
+            videos.len()
+        )));
+        let queue = Mutex::new(videos.into_iter());
+        thread::scope(|scope| {
+            for _ in 0..4 {
+                scope.spawn(|| {
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let Some(v) = queue.lock().ok().and_then(|mut q| q.next()) else {
+                            return;
+                        };
+                        match crate::visual::cached_scenes(&opts.cache, v) {
+                            Ok(sc) => send(Event::Log(format!(
+                                "{} screen changes in {}",
+                                sc.len(),
+                                file_name(v)
+                            ))),
+                            Err(e) => send(Event::Error(format!(
+                                "scene detection {}: {e:#}",
+                                file_name(v)
+                            ))),
+                        }
+                    }
+                });
+            }
+        });
+    }
+
     let mut skills_failed = false;
     if do_skills && !stop.load(Ordering::Relaxed) {
         send(Event::Stage(format!(
@@ -512,7 +550,15 @@ fn skill_worker(
         });
         let _ = tx.send(Event::Log(format!("writing skill {}", ch.slug)));
         let dir = result_chapter_dir(&opts.out, ch);
-        match skill::synthesize(&course.name, ch, &dir, &skills_root, &opts.ai, graph) {
+        match skill::synthesize(
+            &course.name,
+            ch,
+            &dir,
+            &skills_root,
+            &opts.ai,
+            graph,
+            &opts.cache,
+        ) {
             Ok((p, notes)) => {
                 for n in notes {
                     let _ = tx.send(Event::Log(n));

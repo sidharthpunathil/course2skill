@@ -108,7 +108,9 @@ pub fn sentences(pieces: &[Piece]) -> Vec<Sentence> {
                 cur_end = p.words[k].end;
                 wi = k + 1;
             } else if cur_start.is_none() {
-                cur_start = p.words.get(wi).map(|w| w.start);
+                // No aligned word for this token: use the next unused word, or the
+                // last matched time when the chunk's words are used up.
+                cur_start = Some(p.words.get(wi).map_or(cur_end, |w| w.start));
             }
             if !cur.is_empty() {
                 cur.push(' ');

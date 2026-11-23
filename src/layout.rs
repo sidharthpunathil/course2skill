@@ -15,7 +15,7 @@ use std::path::{Component, Path, PathBuf};
 pub const VIDEO_EXTS: &[&str] = &[
     "mp4", "mkv", "mov", "webm", "m4v", "avi", "m4a", "mp3", "wav",
 ];
-pub const DOC_EXTS: &[&str] = &["pdf", "docx", "xlsx", "pptx", "txt", "md"];
+const JUNK_FILES: &[&str] = &["Thumbs.db", "desktop.ini", "Icon\r"];
 const SKIP_DIRS: &[&str] = &["node_modules", "__MACOSX", "target"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
@@ -47,6 +47,8 @@ pub struct UnitPlan {
 #[derive(Debug, Clone)]
 pub struct Course {
     pub name: String,
+    /// Course root; video cache keys are paths relative to it.
+    pub root: PathBuf,
     pub chapters: Vec<Chapter>,
 }
 
@@ -59,7 +61,12 @@ pub struct Chapter {
     /// Folder the frame helper searches for bare video names.
     pub video_dir: PathBuf,
     pub videos: Vec<PathBuf>,
+    /// Transcript file stem for each video, unique within the unit.
+    pub transcript_names: Vec<String>,
+    /// Every other file, copied as-is.
     pub docs: Vec<PathBuf>,
+    /// File name for each copied file, unique within the unit.
+    pub doc_names: Vec<String>,
 }
 
 /// The real course root (single wrapper folders unwrapped) and every content
@@ -130,14 +137,22 @@ pub enum Kind {
     Doc,
 }
 
+/// Videos get transcribed; every other file is course material copied as-is.
+/// `None` only for OS junk files.
 pub fn kind(p: &Path) -> Option<Kind> {
-    let ext = p.extension()?.to_str()?.to_ascii_lowercase();
+    let name = file_name(p);
+    if name.starts_with('.') || JUNK_FILES.contains(&name.as_str()) {
+        return None;
+    }
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
     if VIDEO_EXTS.contains(&ext.as_str()) {
         Some(Kind::Video)
-    } else if DOC_EXTS.contains(&ext.as_str()) {
-        Some(Kind::Doc)
     } else {
-        None
+        Some(Kind::Doc)
     }
 }
 
@@ -279,7 +294,7 @@ pub fn ai_plan(
          Rules:\n- Keep the course's teaching order.\n- Every file appears in exactly one unit. Keep handouts (pdf, docx, xlsx...) with the lessons they belong to.\n- Use the folder structure and numbering when it is meaningful; regroup when folders are just storage (for example, all videos in one folder).\n- Prefer units of roughly 15 to 120 minutes of video. Do not make one unit per tiny clip unless the course is like that.\n- Names start with a two-digit order number, like \"01-Introduction\".\n\n\
          Reply with JSON only, no commentary:\n{{\"units\": [{{\"name\": \"01-Introduction\", \"files\": [\"path/one.mp4\", \"path/notes.pdf\"]}}]}}\n"
     );
-    let answer = ai::complete(cfg, &prompt, root)?;
+    let answer = ai::complete(cfg, &prompt)?;
     let v = ai::extract_json(&answer)?;
     let known: BTreeSet<&str> = files.iter().map(String::as_str).collect();
     let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -378,8 +393,14 @@ pub fn course_from_plan(plan: &Plan) -> Result<(Course, Vec<String>)> {
     let mut warnings = Vec::new();
     let mut chapters = Vec::new();
     let mut slugs = BTreeSet::new();
+    let mut folders = BTreeSet::new();
     for u in &plan.units {
-        let out_rel = safe_rel(&u.folder)?;
+        let mut out_rel = safe_rel(&u.folder)?;
+        let mut n = 2;
+        while !folders.insert(out_rel.clone()) {
+            out_rel = safe_rel(&format!("{} ({n})", u.folder))?;
+            n += 1;
+        }
         let mut videos = Vec::new();
         let mut docs = Vec::new();
         for f in &u.files {
@@ -391,11 +412,21 @@ pub fn course_from_plan(plan: &Plan) -> Result<(Course, Vec<String>)> {
             match kind(&p) {
                 Some(Kind::Video) => videos.push(p),
                 Some(Kind::Doc) => docs.push(p),
-                None => warnings.push(format!("unsupported file in plan: {f}")),
+                None => {}
             }
         }
         videos.sort_by(|a, b| video_order(a, b));
         docs.sort_by(|a, b| natural_cmp(&file_name(a), &file_name(b)));
+        // Transcripts are `<name>.md`; copied files keep their names. Keep both unique.
+        let mut taken: BTreeSet<String> = BTreeSet::new();
+        let transcript_names = videos
+            .iter()
+            .map(|v| unique_name(v, &file_stem(v), ".md", &mut taken))
+            .collect();
+        let doc_names = docs
+            .iter()
+            .map(|d| unique_name(d, &file_name(d), "", &mut taken))
+            .collect();
         let video_dir =
             common_parent(videos.iter().chain(&docs)).unwrap_or_else(|| plan.root.clone());
         let base = slugify(&u.name);
@@ -415,16 +446,55 @@ pub fn course_from_plan(plan: &Plan) -> Result<(Course, Vec<String>)> {
             out_rel,
             video_dir,
             videos,
+            transcript_names,
             docs,
+            doc_names,
         });
     }
     Ok((
         Course {
             name: plan.course.clone(),
+            root: plan.root.clone(),
             chapters,
         },
         warnings,
     ))
+}
+
+/// `name` (or `<parent folder> - name` when taken) such that `name + suffix` is unused.
+fn unique_name(path: &Path, name: &str, suffix: &str, taken: &mut BTreeSet<String>) -> String {
+    let parent = path.parent().map(file_name).unwrap_or_default();
+    let mut candidate = name.to_string();
+    let mut n = 1;
+    while !taken.insert(format!("{candidate}{suffix}").to_lowercase()) {
+        candidate = if n == 1 {
+            format!("{parent} - {name}")
+        } else {
+            format!("{parent} - {name} ({n})")
+        };
+        n += 1;
+    }
+    candidate
+}
+
+/// Adds files that exist now but are missing from a saved plan, so new lessons
+/// are never silently ignored. Returns how many were added.
+pub fn add_missing(plan: &mut Plan, files: &[String]) -> usize {
+    let known: BTreeSet<&String> = plan.units.iter().flat_map(|u| &u.files).collect();
+    let missing: Vec<String> = files
+        .iter()
+        .filter(|f| !known.contains(f))
+        .cloned()
+        .collect();
+    let n = missing.len();
+    if n > 0 {
+        plan.units.push(UnitPlan {
+            name: "New files".into(),
+            folder: "99-New files".into(),
+            files: missing,
+        });
+    }
+    n
 }
 
 fn common_parent<'a>(mut paths: impl Iterator<Item = &'a PathBuf>) -> Option<PathBuf> {
@@ -569,11 +639,13 @@ mod tests {
         touch(&c.join("01-A/notes [a], b.pdf"));
         touch(&c.join("01-A/.DS_Store"));
         touch(&c.join("01-A/cover.jpg"));
+        touch(&c.join("01-A/Thumbs.db"));
         let (root, files) = inventory(tmp.path(), &[]).unwrap();
         assert_eq!(file_name(&root), "My Course");
         assert_eq!(
             files,
             [
+                "01-A/cover.jpg",
                 "01-A/notes [a], b.pdf",
                 "01-A/Video_y.mp4",
                 "01-A/Video_y_video2.mp4",
@@ -646,6 +718,54 @@ mod tests {
         let files: Vec<String> = ["intro.mp4", "deep dive.mp4"].map(String::from).to_vec();
         let plan = heuristic_plan("C", Path::new("/c"), &files);
         assert_eq!(names(&plan), ["C"]);
+    }
+
+    #[test]
+    fn same_stem_files_get_unique_output_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for f in [
+            "L1/video.mp4",
+            "L2/video.mp4",
+            "L1/video.md",
+            "L2/notes.pdf",
+        ] {
+            touch(&tmp.path().join(f));
+        }
+        let plan = Plan {
+            course: "C".into(),
+            root: tmp.path().to_path_buf(),
+            units: vec![UnitPlan {
+                name: "U".into(),
+                folder: "U".into(),
+                files: [
+                    "L1/video.mp4",
+                    "L2/video.mp4",
+                    "L1/video.md",
+                    "L2/notes.pdf",
+                ]
+                .map(String::from)
+                .to_vec(),
+            }],
+        };
+        let (c, _) = course_from_plan(&plan).unwrap();
+        let ch = &c.chapters[0];
+        assert_eq!(ch.transcript_names, ["video", "L2 - video"]);
+        assert_eq!(ch.doc_names, ["notes.pdf", "L1 - video.md"]);
+    }
+
+    #[test]
+    fn add_missing_collects_new_files() {
+        let mut plan = Plan {
+            course: "C".into(),
+            root: "/c".into(),
+            units: vec![UnitPlan {
+                name: "U".into(),
+                folder: "U".into(),
+                files: vec!["a.mp4".into()],
+            }],
+        };
+        assert_eq!(add_missing(&mut plan, &["a.mp4".into(), "b.mp4".into()]), 1);
+        assert_eq!(plan.units[1].files, ["b.mp4"]);
     }
 
     #[test]

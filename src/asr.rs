@@ -17,6 +17,8 @@ pub struct Asr {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// Forced language name (e.g. "English"); empty lets the model detect it.
+    language: String,
     // Keeps the embedded worker script alive (deleted on drop).
     _script: Option<tempfile::TempPath>,
 }
@@ -81,7 +83,7 @@ pub fn setup(venv: &Path) -> Result<PathBuf> {
 
 impl Asr {
     /// Starts the worker and waits until both models are loaded (first run downloads them).
-    pub fn spawn(python: &Path, model: &str, aligner: &str) -> Result<Asr> {
+    pub fn spawn(python: &Path, model: &str, aligner: &str, language: &str) -> Result<Asr> {
         let (script_path, script) = match std::env::var_os("COURSE2SKILL_WORKER") {
             Some(p) => (PathBuf::from(p), None),
             None => {
@@ -114,6 +116,7 @@ impl Asr {
             child,
             stdin,
             stdout,
+            language: language.to_string(),
             _script: script,
         };
         let hello = asr.read_line()?;
@@ -148,7 +151,19 @@ impl Asr {
         span: Span,
         context: &str,
     ) -> Result<(String, Vec<Word>)> {
-        let req = json!({ "wav": wav, "start": span.start, "end": span.end, "context": context });
+        let mtime = std::fs::metadata(wav)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        let req = json!({
+            "wav": wav,
+            "wav_id": format!("{}#{mtime}", wav.display()),
+            "start": span.start,
+            "end": span.end,
+            "context": context,
+            "language": self.language,
+        });
         writeln!(self.stdin, "{req}")?;
         self.stdin.flush()?;
         let resp = self.read_line()?;
@@ -203,7 +218,7 @@ mod tests {
         std::fs::write(&script, src).unwrap();
         // SAFETY: guarded by the ENV mutex; these tests are the only writers.
         unsafe { std::env::set_var("COURSE2SKILL_WORKER", &script) };
-        let r = Asr::spawn(Path::new("python3"), "m-model", "m-aligner");
+        let r = Asr::spawn(Path::new("python3"), "m-model", "m-aligner", "English");
         unsafe { std::env::remove_var("COURSE2SKILL_WORKER") };
         r
     }

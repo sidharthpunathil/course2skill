@@ -159,8 +159,8 @@ impl App {
     }
 }
 
-/// Runs the TUI until the pipeline finishes and the user quits.
-pub fn run(rx: &Receiver<Event>, stop: &AtomicBool) -> Result<()> {
+/// Runs the TUI until the user quits. Returns the pipeline's result if it finished.
+pub fn run(rx: &Receiver<Event>, stop: &AtomicBool) -> Result<Option<bool>> {
     let mut terminal = ratatui::init();
     let result = event_loop(&mut terminal, rx, stop);
     ratatui::restore();
@@ -171,7 +171,7 @@ fn event_loop(
     terminal: &mut DefaultTerminal,
     rx: &Receiver<Event>,
     stop: &AtomicBool,
-) -> Result<()> {
+) -> Result<Option<bool>> {
     let mut app = App::new();
     loop {
         while let Ok(ev) = rx.try_recv() {
@@ -188,7 +188,7 @@ fn event_loop(
                 && (k.code == KeyCode::Char('q') || k.code == KeyCode::Esc || ctrl_c)
             {
                 stop.store(true, Ordering::Relaxed);
-                return Ok(());
+                return Ok(app.finished.as_ref().map(|(ok, _)| *ok));
             }
         }
     }
@@ -300,6 +300,7 @@ fn state_badge(state: ChState, tick: usize) -> (String, Color, &'static str) {
     let spin = SPINNER[tick % SPINNER.len()].to_string();
     match state {
         ChState::Pending => ("○".into(), DIM, "waiting"),
+        ChState::Skipped => ("–".into(), BORDER, "not selected"),
         ChState::Docs => (spin, WARM, "handouts"),
         ChState::Transcribing => (spin, ACCENT, "transcribing"),
         ChState::Transcribed => ("◆".into(), ACCENT, "transcribed"),
@@ -436,7 +437,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
     let hint = if app.finished.is_some() {
         "press q to exit"
     } else {
-        "q quit (progress is saved, rerun to resume)"
+        "q quit (progress is saved; the same command continues this run)"
     };
     f.render_widget(
         Paragraph::new(Line::from(vec![

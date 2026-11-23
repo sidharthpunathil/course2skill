@@ -56,6 +56,28 @@ fn is_stamp(name: &str) -> bool {
     b.len() >= 19 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-' && b[10] == b'_'
 }
 
+const DONE: &str = ".done";
+
+/// Marks a run as finished without errors.
+pub fn mark_done(run: &Path) -> Result<()> {
+    std::fs::write(run.join(DONE), chrono::Local::now().to_rfc3339())?;
+    Ok(())
+}
+
+pub fn is_done(run: &Path) -> bool {
+    run.join(DONE).exists()
+}
+
+/// The newest run if it did not finish, so a rerun continues it.
+pub fn unfinished_latest(base: &Path) -> Option<PathBuf> {
+    list(base).pop().filter(|r| !is_done(r))
+}
+
+/// Points `latest` at an existing run (used when resuming).
+pub fn touch_latest(base: &Path, run: &Path) -> Result<()> {
+    point_latest(base, run)
+}
+
 /// Resolves `latest` or a run folder name.
 pub fn resolve(base: &Path, name: &str) -> Result<PathBuf> {
     if name == LATEST {
@@ -85,6 +107,15 @@ mod tests {
             std::fs::read_link(tmp.path().join(LATEST)).unwrap(),
             b.file_name().unwrap()
         );
+    }
+
+    #[test]
+    fn unfinished_latest_ignores_done_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let a = new_run(tmp.path()).unwrap();
+        assert_eq!(unfinished_latest(tmp.path()), Some(a.clone()));
+        mark_done(&a).unwrap();
+        assert_eq!(unfinished_latest(tmp.path()), None);
     }
 
     #[test]

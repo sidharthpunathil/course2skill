@@ -42,11 +42,13 @@ def main():
             continue
         try:
             req = json.loads(line)
-            if req["wav"] != cached_path:
+            # The id includes the file's mtime, so a re-extracted WAV is reloaded.
+            wav_id = req.get("wav_id") or req["wav"]
+            if wav_id != cached_path:
                 audio, rate = sf.read(req["wav"], dtype="float32", always_2d=False)
                 if audio.ndim > 1:
                     audio = audio.mean(axis=1)
-                cached_path = req["wav"]
+                cached_path = wav_id
             a = max(0, int(req["start"] * rate))
             b = min(len(audio), int(req["end"] * rate))
             clip = np.ascontiguousarray(audio[a:b])
@@ -58,7 +60,7 @@ def main():
                 model=model,
                 forced_aligner=aligner,
                 return_timestamps=True,
-                language=req.get("language") or "English",
+                language=req.get("language") or None,
                 context=req.get("context", ""),
             )
             words = [

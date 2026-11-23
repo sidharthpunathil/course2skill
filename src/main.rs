@@ -70,6 +70,9 @@ struct AsrArgs {
     /// Forced aligner used for word timestamps
     #[arg(long, default_value = asr::DEFAULT_ALIGNER)]
     aligner: String,
+    /// Spoken language, e.g. English, Spanish, Chinese ("auto" to detect)
+    #[arg(long, default_value = "English")]
+    language: String,
 }
 
 #[derive(Args, Clone)]
@@ -96,6 +99,9 @@ struct RunArgs {
     /// `skills` uses the latest run by default
     #[arg(long)]
     run: Option<String>,
+    /// Always start a new run, even if the latest one did not finish
+    #[arg(long, conflicts_with = "run")]
+    new: bool,
     /// How lessons are grouped into units
     #[arg(long, value_enum, default_value_t = LayoutMode::Auto)]
     layout: LayoutMode,
@@ -135,6 +141,9 @@ fn parse_units(s: &str) -> Result<Vec<usize>> {
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if let Some((a, b)) = part.split_once('-') {
             let (a, b): (usize, usize) = (a.trim().parse()?, b.trim().parse()?);
+            if a > b {
+                bail!("bad range {part:?}: start is after end");
+            }
             out.extend(a..=b);
         } else {
             out.push(
@@ -168,31 +177,73 @@ fn plan_for(args: &RunArgs) -> Result<layout::Plan> {
 /// Picks the run folder (new, latest or named), plans the course and saves the plan there.
 fn start(args: &RunArgs, stages: Stages) -> Result<bool> {
     let base = out_dir(&args.out)?;
-    let run = match (&args.run, stages) {
-        (Some(name), _) => runs::resolve(&base, name)?,
-        (None, Stages::SkillsOnly) => runs::resolve(&base, runs::LATEST)
-            .context("no earlier run to write skills from; use `run` or `transcribe` first")?,
-        (None, _) => runs::new_run(&base)?,
-    };
-    // A run's own plan wins; a new run starts from the latest run's plan.
-    let prior = if run.join("plan.json").exists() {
-        Some(run.clone())
-    } else {
-        runs::list(&base)
-            .into_iter()
-            .rev()
-            .find(|r| r.join("plan.json").exists())
-    };
+    // Check the AI before creating anything, so a failed start leaves no empty run.
+    preflight(args, stages)?;
     let (root, files) = layout::inventory(&args.course, std::slice::from_ref(&base))?;
-    let plan = wizard::make_plan(
-        &root,
-        &files,
-        args.layout,
-        &args.ai.config(),
-        prior.as_deref(),
-    )?;
+    let existing = match (&args.run, stages) {
+        (Some(name), _) => Some(runs::resolve(&base, name)?),
+        (None, Stages::SkillsOnly) => Some(
+            runs::resolve(&base, runs::LATEST)
+                .context("no earlier run to write skills from; use `run` or `transcribe` first")?,
+        ),
+        (None, _) if !args.new => runs::unfinished_latest(&base),
+        _ => None,
+    };
+    let plan = match &existing {
+        // Continuing a run: keep its own plan so units match what is on disk.
+        Some(run) if run.join("plan.json").exists() => {
+            let mut plan = layout::load_plan(run, &root)
+                .context("the run's plan.json is for a different course folder")?;
+            let added = layout::add_missing(&mut plan, &files);
+            if added > 0 {
+                eprintln!("note: {added} new course files added to unit \"New files\"");
+            }
+            plan
+        }
+        _ => {
+            let prior = runs::list(&base)
+                .into_iter()
+                .rev()
+                .find(|r| r.join("plan.json").exists());
+            let mut plan = wizard::make_plan(
+                &root,
+                &files,
+                args.layout,
+                &args.ai.config(),
+                prior.as_deref(),
+            )?;
+            let added = layout::add_missing(&mut plan, &files);
+            if added > 0 {
+                eprintln!(
+                    "note: {added} course files not in the saved plan were added to unit \"New files\""
+                );
+            }
+            plan
+        }
+    };
+    let run = match existing {
+        Some(run) => {
+            eprintln!("continuing run {}", run.display());
+            runs::touch_latest(&base, &run)?;
+            run
+        }
+        None => runs::new_run(&base)?,
+    };
     layout::save_plan(&plan, &run)?;
     run_pipeline(&plan, args, stages, &base, &run)
+}
+
+fn preflight(args: &RunArgs, stages: Stages) -> Result<()> {
+    if matches!(stages, Stages::All | Stages::SkillsOnly) {
+        let (ok, why) = args.ai.ai.availability();
+        if !ok {
+            bail!(
+                "{} is not ready ({why}). Pick another with --ai",
+                args.ai.ai.label()
+            );
+        }
+    }
+    Ok(())
 }
 
 fn print_plan(plan: &layout::Plan) {
@@ -238,14 +289,16 @@ fn run_pipeline(
         ai: args.ai.config(),
         silence_db: args.silence_db,
         silence_min: 0.3,
+        language: if args.asr.language.eq_ignore_ascii_case("auto") {
+            String::new()
+        } else {
+            args.asr.language.clone()
+        },
     };
-    if matches!(stages, Stages::All | Stages::SkillsOnly) {
-        let (ok, why) = opts.ai.backend.availability();
-        if !ok {
-            bail!(
-                "{} is not ready ({why}). Pick another with --ai",
-                opts.ai.backend.label()
-            );
+    if let Some(units) = &opts.chapters {
+        let n = course.chapters.len();
+        if let Some(bad) = units.iter().find(|u| **u == 0 || **u > n) {
+            bail!("unit {bad} does not exist (the plan has {n} units; see `course2skill plan`)");
         }
     }
     let (tx, rx) = channel::<Event>();
@@ -309,11 +362,15 @@ fn run_pipeline(
         return Ok(ok);
     }
 
-    tui::run(&rx, &stop)?;
+    let finished = tui::run(&rx, &stop)?;
     if !worker.is_finished() {
-        eprintln!("stopping… progress is saved; rerun the same command to resume");
+        // Stop agent CLIs that are still writing skills, then let the pipeline unwind.
+        ai::kill_all();
+        eprintln!("stopped. Progress is saved; run the same command again to continue this run.");
+        return Ok(false);
     }
-    Ok(true)
+    let _ = worker.join();
+    Ok(finished.unwrap_or(false))
 }
 
 fn doctor(a: &AsrArgs) -> Result<bool> {
@@ -364,6 +421,7 @@ fn wizard_flow() -> Result<bool> {
         course: choice.plan.root.clone(),
         out: out.clone(),
         run: None,
+        new: true,
         layout: LayoutMode::Auto,
         units: None,
         force: false,
@@ -379,6 +437,7 @@ fn wizard_flow() -> Result<bool> {
             venv: None,
             asr_model: asr::DEFAULT_MODEL.into(),
             aligner: asr::DEFAULT_ALIGNER.into(),
+            language: "English".into(),
         },
     };
     let base = out_dir(&out)?;
@@ -430,5 +489,6 @@ mod tests {
     #[test]
     fn parse_units_rejects_junk() {
         assert!(parse_units("x").is_err());
+        assert!(parse_units("5-3").is_err());
     }
 }

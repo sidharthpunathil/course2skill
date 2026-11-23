@@ -43,11 +43,15 @@ pub struct Opts {
     pub ai: AiConfig,
     pub silence_db: i32,
     pub silence_min: f64,
+    /// Forced transcription language; empty lets the model detect it.
+    pub language: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChState {
     Pending,
+    /// Not selected with --units.
+    Skipped,
     Docs,
     Transcribing,
     Transcribed,
@@ -150,13 +154,13 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
     for i in (0..course.chapters.len()).filter(|i| !selected.contains(i)) {
         send(Event::Chapter {
             idx: i,
-            state: ChState::Done,
+            state: ChState::Skipped,
         });
     }
     let mut failed: BTreeSet<usize> = BTreeSet::new();
 
     if do_docs {
-        send(Event::Stage("Handouts".into()));
+        send(Event::Stage("Copying course files".into()));
         for &idx in &selected {
             let ch = &course.chapters[idx];
             let dir = result_chapter_dir(&opts.out, ch);
@@ -168,17 +172,19 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                 idx,
                 state: ChState::Docs,
             });
-            for doc in &ch.docs {
-                let target = dir.join(format!("{}.md", file_stem(doc)));
-                if target.exists() && !opts.force {
+            for (doc, name) in ch.docs.iter().zip(&ch.doc_names) {
+                let target = dir.join(name);
+                let same_size = std::fs::metadata(&target).ok().map(|m| m.len())
+                    == std::fs::metadata(doc).ok().map(|m| m.len());
+                if target.exists() && same_size && !opts.force {
                     continue;
                 }
-                match docs::convert(doc) {
-                    Ok(md) => {
-                        std::fs::write(&target, skill::strip_invisible(&md))?;
-                        send(Event::Log(format!("handout → {}", file_name(&target))));
+                match std::fs::copy(doc, &target) {
+                    Ok(_) => send(Event::Log(format!("copied {name}"))),
+                    Err(e) => {
+                        failed.insert(idx);
+                        send(Event::Error(format!("copying {}: {e}", file_name(doc))));
                     }
-                    Err(e) => send(Event::Error(format!("{}: {e:#}", file_name(doc)))),
                 }
             }
             send(Event::Chapter {
@@ -202,12 +208,12 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                 idx,
                 state: ChState::Transcribing,
             });
-            let context = context_terms(&course.name, ch, &dir);
-            for video in &ch.videos {
+            let context = context_terms(&course.name, ch);
+            for (video, name) in ch.videos.iter().zip(&ch.transcript_names) {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let target = dir.join(format!("{}.md", file_stem(video)));
+                let target = dir.join(format!("{name}.md"));
                 if target.exists() && !opts.force {
                     send(Event::Log(format!(
                         "already transcribed: {}",
@@ -224,15 +230,23 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                         opts.asr_model
                     )));
                     let python = check_setup(&opts.venv)?;
-                    asr = Some(Asr::spawn(&python, &opts.asr_model, &opts.aligner)?);
+                    asr = Some(Asr::spawn(
+                        &python,
+                        &opts.asr_model,
+                        &opts.aligner,
+                        &opts.language,
+                    )?);
                     send(Event::Log("speech model ready".into()));
                 }
                 let Some(engine) = asr.as_mut() else { continue };
-                if let Err(e) =
-                    transcribe_video(engine, idx, ch, video, &target, &context, opts, tx, stop)
-                {
+                let cache = cache_base(&opts.cache, &course.root, video, &opts.asr_model);
+                if let Err(e) = transcribe_video(
+                    engine, idx, video, &cache, &target, &context, opts, tx, stop,
+                ) {
                     failed.insert(idx);
                     send(Event::Error(format!("{}: {e:#}", file_name(video))));
+                    // The worker may have died; start a fresh one for the next video.
+                    asr = None;
                 }
             }
             if stop.load(Ordering::Relaxed) {
@@ -287,6 +301,9 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
     }
 
     let ok = failed.is_empty() && !skills_failed && !stop.load(Ordering::Relaxed);
+    if ok && opts.stages == Stages::All && opts.chapters.is_none() {
+        crate::runs::mark_done(&opts.out)?;
+    }
     send(Event::Finished {
         ok,
         out: opts.out.clone(),
@@ -295,8 +312,9 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
 }
 
 /// Domain words for the speech model: course and unit names plus capitalized
-/// terms from the unit's handouts (tool names, brands, jargon).
-fn context_terms(course: &str, ch: &Chapter, result_dir: &Path) -> String {
+/// terms from the unit's files (tool names, brands, jargon). Read in memory;
+/// nothing is written.
+fn context_terms(course: &str, ch: &Chapter) -> String {
     let mut terms: Vec<String> = Vec::new();
     let mut seen = BTreeSet::new();
     let mut add = |w: &str| {
@@ -315,8 +333,7 @@ fn context_terms(course: &str, ch: &Chapter, result_dir: &Path) -> String {
         add(w);
     }
     for doc in &ch.docs {
-        let md = result_dir.join(format!("{}.md", file_stem(doc)));
-        if let Ok(text) = std::fs::read_to_string(md) {
+        if let Ok(text) = docs::convert(doc) {
             for w in text.split_whitespace().take(4000) {
                 add(w);
             }
@@ -326,23 +343,41 @@ fn context_terms(course: &str, ch: &Chapter, result_dir: &Path) -> String {
     terms.join(" ")
 }
 
+/// Cache location for one video: keyed by its path inside the course and the
+/// speech model, so regrouping units or changing output names keeps the cache.
+fn cache_base(cache: &Path, root: &Path, video: &Path, model: &str) -> PathBuf {
+    let rel = video.strip_prefix(root).unwrap_or(video);
+    let tag = if model == crate::asr::DEFAULT_MODEL {
+        "qwen".to_string()
+    } else {
+        format!("qwen-{}", crate::layout::slugify(model))
+    };
+    let parent = rel.parent().map(Path::to_path_buf).unwrap_or_default();
+    cache
+        .join(parent)
+        .join(format!("{}.{tag}", file_stem(video)))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn transcribe_video(
     asr: &mut Asr,
     idx: usize,
-    ch: &Chapter,
     video: &Path,
+    cache_base: &Path,
     target: &Path,
     context: &str,
     opts: &Opts,
     tx: &Sender<Event>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let work = opts.cache.join(&ch.out_rel);
-    std::fs::create_dir_all(&work)?;
+    if let Some(dir) = cache_base.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
     let stem = file_stem(video);
-    let wav = work.join(format!("{stem}.wav"));
-    let mut cache = Cache::load(&work.join(format!("{stem}.qwen.json")))?;
+    // Append (not replace) extensions: the base ends in the model tag, e.g. `.qwen`.
+    let with_ext = |ext: &str| PathBuf::from(format!("{}.{ext}", cache_base.display()));
+    let wav = with_ext("wav");
+    let mut cache = Cache::load(&with_ext("json"))?;
 
     media::extract_wav(video, &wav)?;
     let duration = media::probe_duration(&wav)?;
@@ -361,7 +396,9 @@ fn transcribe_video(
             return Ok(());
         }
         let (piece, cached) = match cache.get(i) {
-            Some(p) if (p.start - span.start).abs() < 0.01 => (p.clone(), true),
+            Some(p) if (p.start - span.start).abs() < 0.01 && (p.end - span.end).abs() < 0.01 => {
+                (p.clone(), true)
+            }
             _ => {
                 let (text, words) = asr
                     .transcribe(&wav, *span, context)
@@ -413,7 +450,7 @@ fn skill_worker(
         let Some(idx) = next else { return };
         let ch = &course.chapters[idx];
         let skills_root = opts.out.join("skills");
-        if skills_root.join(&ch.slug).join("SKILL.md").exists() && !opts.force {
+        if skills_root.join(&ch.slug).join(skill::COMPLETE).exists() && !opts.force {
             let _ = tx.send(Event::Log(format!("skill exists, skipping {}", ch.slug)));
             let _ = tx.send(Event::Chapter {
                 idx,
@@ -444,5 +481,28 @@ fn skill_worker(
                 });
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cache_base_keeps_old_layout_and_tags_model() {
+        let b = cache_base(
+            Path::new("/r/.cache"),
+            Path::new("/c"),
+            Path::new("/c/01-Intro/1.1 Hi.mp4"),
+            crate::asr::DEFAULT_MODEL,
+        );
+        assert_eq!(b, Path::new("/r/.cache/01-Intro/1.1 Hi.qwen"));
+        let small = cache_base(
+            Path::new("/r/.cache"),
+            Path::new("/c"),
+            Path::new("/c/a.mp4"),
+            "Qwen/Qwen3-ASR-0.6B",
+        );
+        assert_eq!(small, Path::new("/r/.cache/a.qwen-qwen-qwen3-asr-0-6b"));
     }
 }

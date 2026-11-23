@@ -143,11 +143,42 @@ pub fn which(bin: &str) -> bool {
 }
 
 /// Asks for a plain-text answer. Agent CLIs run without write access.
-pub fn complete(cfg: &AiConfig, prompt: &str, cwd: &Path) -> Result<String> {
+/// Agent CLIs run in an empty temporary folder so they cannot touch real files.
+pub fn complete(cfg: &AiConfig, prompt: &str) -> Result<String> {
     match cfg.backend {
         Backend::Anthropic => anthropic(cfg, prompt),
         Backend::Openai | Backend::Local => openai_compatible(cfg, prompt),
-        _ => run_cli(cfg, prompt, cwd, false),
+        _ => {
+            let scratch = tempfile::tempdir()?;
+            run_cli(cfg, prompt, scratch.path(), false)
+        }
+    }
+}
+
+/// Process ids of running agent CLIs, so quitting can stop them.
+static CHILDREN: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// Stops every agent CLI still running (and anything it started).
+pub fn kill_all() {
+    let pids: Vec<u32> = CHILDREN
+        .lock()
+        .map(|mut c| std::mem::take(&mut *c))
+        .unwrap_or_default();
+    for pid in pids {
+        // Each child leads its own process group; signal the whole group.
+        let _ = Command::new("kill")
+            .args(["-TERM", &format!("-{pid}")])
+            .status();
+    }
+}
+
+fn track(pid: u32, add: bool) {
+    if let Ok(mut c) = CHILDREN.lock() {
+        if add {
+            c.push(pid);
+        } else {
+            c.retain(|p| *p != pid);
+        }
     }
 }
 
@@ -234,13 +265,23 @@ fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<Stri
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("could not start `{bin}`"))?;
+    let pid = child.id();
+    track(pid, true);
     if via_stdin && let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(prompt.as_bytes())?;
+        // Write from a thread so a large prompt cannot deadlock against a full stdout pipe.
+        let prompt = prompt.to_string();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(prompt.as_bytes());
+        });
     }
-    let out = child.wait_with_output()?;
+    let out = child.wait_with_output();
+    track(pid, false);
+    let out = out?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
@@ -335,9 +376,11 @@ fn anthropic(cfg: &AiConfig, prompt: &str) -> Result<String> {
         }
     }
     match stop.as_str() {
+        "end_turn" | "stop_sequence" => Ok(text),
         "refusal" => bail!("the model declined this request"),
         "max_tokens" => bail!("the answer hit max_tokens and was cut off"),
-        _ => Ok(text),
+        "" => bail!("the response stream ended early (no stop reason)"),
+        other => bail!("unexpected stop reason {other:?}"),
     }
 }
 
@@ -374,6 +417,9 @@ fn openai_compatible(cfg: &AiConfig, prompt: &str) -> Result<String> {
     }
     let body = json!({ "model": model, "messages": [{"role": "user", "content": prompt}] });
     let resp: Value = req.send_json(body).map_err(http_error)?.into_json()?;
+    if resp["choices"][0]["finish_reason"] == "length" {
+        bail!("the answer hit the model's output limit and was cut off");
+    }
     resp["choices"][0]["message"]["content"]
         .as_str()
         .map(str::to_string)

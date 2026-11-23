@@ -1,5 +1,29 @@
+# Course content and generated output
 /course/
 /result/
-/target/
-.DS_Store
+frames/
 *.wav
+
+# Build
+/target/
+
+# Logs and local state
+*.log
+.env
+.env.*
+!.env.example
+.claude/settings.local.json
+graphify-out/
+.opensrc/
+
+# Python worker
+__pycache__/
+*.pyc
+.venv/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

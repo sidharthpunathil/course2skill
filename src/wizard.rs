@@ -294,11 +294,12 @@ impl Wizard {
             .min(self.layouts.len() - 1)]
         .0;
         let ai = self.ai_config();
-        let out = self.out.clone();
+        let prior = crate::runs::resolve(&self.out, crate::runs::LATEST).ok();
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ =
-                tx.send(make_plan(&root, &files, mode, &ai, &out).map_err(|e| format!("{e:#}")));
+            let _ = tx.send(
+                make_plan(&root, &files, mode, &ai, prior.as_deref()).map_err(|e| format!("{e:#}")),
+            );
         });
         self.planning = Some(rx);
         self.error = None;
@@ -529,7 +530,7 @@ impl Wizard {
             })
             .collect();
         let title = format!(
-            "{} units from {total} files · plan saved to {}/plan.json",
+            "{} units from {total} files · saved as plan.json in a new run folder under {}",
             plan.units.len(),
             self.out.display()
         );
@@ -557,17 +558,18 @@ fn frame_block(title: &str) -> Block<'_> {
     }
 }
 
-/// Builds and saves the plan for a course root (shared by the wizard and the CLI).
+/// Builds the plan for a course root (shared by the wizard and the CLI).
+/// In `Auto` mode a plan saved in `prior` (the latest run) is reused.
 pub fn make_plan(
     root: &Path,
     files: &[String],
     mode: LayoutMode,
     ai_cfg: &AiConfig,
-    out: &Path,
+    prior: Option<&Path>,
 ) -> Result<Plan> {
     let course = layout::file_name(root);
     if mode == LayoutMode::Auto
-        && let Some(saved) = layout::load_plan(out, root)
+        && let Some(saved) = prior.and_then(|p| layout::load_plan(p, root))
     {
         return Ok(saved);
     }
@@ -586,6 +588,5 @@ pub fn make_plan(
         }
         _ => layout::heuristic_plan(&course, root, files),
     };
-    layout::save_plan(&plan, out)?;
     Ok(plan)
 }

@@ -29,7 +29,10 @@ pub enum Stages {
 
 #[derive(Debug, Clone)]
 pub struct Opts {
+    /// This run's folder.
     pub out: PathBuf,
+    /// Speech cache shared by every run.
+    pub cache: PathBuf,
     pub venv: PathBuf,
     pub asr_model: String,
     pub aligner: String,
@@ -335,7 +338,7 @@ fn transcribe_video(
     tx: &Sender<Event>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let work = opts.out.join(".cache").join(&ch.out_rel);
+    let work = opts.cache.join(&ch.out_rel);
     std::fs::create_dir_all(&work)?;
     let stem = file_stem(video);
     let wav = work.join(format!("{stem}.wav"));

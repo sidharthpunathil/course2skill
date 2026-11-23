@@ -7,6 +7,7 @@ mod docs;
 mod layout;
 mod media;
 mod pipeline;
+mod runs;
 mod skill;
 mod transcript;
 mod tui;
@@ -88,9 +89,13 @@ struct AiArgs {
 struct RunArgs {
     /// Course folder, any layout
     course: PathBuf,
-    /// Output folder
+    /// Base output folder. Each run gets a timestamped folder inside it
     #[arg(long, default_value = "result")]
     out: PathBuf,
+    /// Continue an existing run ("latest" or a folder name) instead of starting a new one.
+    /// `skills` uses the latest run by default
+    #[arg(long)]
+    run: Option<String>,
     /// How lessons are grouped into units
     #[arg(long, value_enum, default_value_t = LayoutMode::Auto)]
     layout: LayoutMode,
@@ -146,18 +151,55 @@ fn out_dir(out: &Path) -> Result<PathBuf> {
     Ok(out.canonicalize()?)
 }
 
+/// Plans the course against the latest run's saved plan, without creating anything.
 fn plan_for(args: &RunArgs) -> Result<layout::Plan> {
-    let out = out_dir(&args.out)?;
-    let (root, files) = layout::inventory(&args.course, std::slice::from_ref(&out))?;
-    wizard::make_plan(&root, &files, args.layout, &args.ai.config(), &out)
+    let base = out_dir(&args.out)?;
+    let prior = runs::resolve(&base, runs::LATEST).ok();
+    let (root, files) = layout::inventory(&args.course, std::slice::from_ref(&base))?;
+    wizard::make_plan(
+        &root,
+        &files,
+        args.layout,
+        &args.ai.config(),
+        prior.as_deref(),
+    )
 }
 
-fn print_plan(plan: &layout::Plan, out: &Path) {
+/// Picks the run folder (new, latest or named), plans the course and saves the plan there.
+fn start(args: &RunArgs, stages: Stages) -> Result<bool> {
+    let base = out_dir(&args.out)?;
+    let run = match (&args.run, stages) {
+        (Some(name), _) => runs::resolve(&base, name)?,
+        (None, Stages::SkillsOnly) => runs::resolve(&base, runs::LATEST)
+            .context("no earlier run to write skills from; use `run` or `transcribe` first")?,
+        (None, _) => runs::new_run(&base)?,
+    };
+    // A run's own plan wins; a new run starts from the latest run's plan.
+    let prior = if run.join("plan.json").exists() {
+        Some(run.clone())
+    } else {
+        runs::list(&base)
+            .into_iter()
+            .rev()
+            .find(|r| r.join("plan.json").exists())
+    };
+    let (root, files) = layout::inventory(&args.course, std::slice::from_ref(&base))?;
+    let plan = wizard::make_plan(
+        &root,
+        &files,
+        args.layout,
+        &args.ai.config(),
+        prior.as_deref(),
+    )?;
+    layout::save_plan(&plan, &run)?;
+    run_pipeline(&plan, args, stages, &base, &run)
+}
+
+fn print_plan(plan: &layout::Plan) {
     println!(
-        "{} → {} units (plan: {}/plan.json)",
+        "{} → {} units (edit result/latest/plan.json to regroup; the next run picks it up)",
         plan.course,
-        plan.units.len(),
-        out.display()
+        plan.units.len()
     );
     for (i, u) in plan.units.iter().enumerate() {
         let videos = u
@@ -175,10 +217,17 @@ fn print_plan(plan: &layout::Plan, out: &Path) {
     }
 }
 
-fn run_pipeline(plan: &layout::Plan, args: &RunArgs, stages: Stages) -> Result<bool> {
+fn run_pipeline(
+    plan: &layout::Plan,
+    args: &RunArgs,
+    stages: Stages,
+    base: &Path,
+    run: &Path,
+) -> Result<bool> {
     let (course, warnings) = layout::course_from_plan(plan)?;
     let opts = Opts {
-        out: out_dir(&args.out)?,
+        out: run.to_path_buf(),
+        cache: runs::cache_dir(base),
         venv: args.asr.venv.clone().unwrap_or_else(asr::default_venv),
         asr_model: args.asr.asr_model.clone(),
         aligner: args.asr.aligner.clone(),
@@ -313,7 +362,8 @@ fn wizard_flow() -> Result<bool> {
     };
     let args = RunArgs {
         course: choice.plan.root.clone(),
-        out,
+        out: out.clone(),
+        run: None,
         layout: LayoutMode::Auto,
         units: None,
         force: false,
@@ -331,22 +381,23 @@ fn wizard_flow() -> Result<bool> {
             aligner: asr::DEFAULT_ALIGNER.into(),
         },
     };
-    run_pipeline(&choice.plan, &args, Stages::All)
+    let base = out_dir(&out)?;
+    let run = runs::new_run(&base)?;
+    layout::save_plan(&choice.plan, &run)?;
+    run_pipeline(&choice.plan, &args, Stages::All, &base, &run)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
         None => wizard_flow(),
-        Some(Cmd::Run(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::All)),
-        Some(Cmd::Transcribe(a)) => {
-            plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::TranscribeOnly))
-        }
-        Some(Cmd::Docs(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::DocsOnly)),
-        Some(Cmd::Skills(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::SkillsOnly)),
-        Some(Cmd::Plan(a)) => plan_for(&a).and_then(|p| {
-            print_plan(&p, &out_dir(&a.out)?);
-            Ok(true)
+        Some(Cmd::Run(a)) => start(&a, Stages::All),
+        Some(Cmd::Transcribe(a)) => start(&a, Stages::TranscribeOnly),
+        Some(Cmd::Docs(a)) => start(&a, Stages::DocsOnly),
+        Some(Cmd::Skills(a)) => start(&a, Stages::SkillsOnly),
+        Some(Cmd::Plan(a)) => plan_for(&a).map(|p| {
+            print_plan(&p);
+            true
         }),
         Some(Cmd::Frame { video, at, out }) => media::parse_ts(&at)
             .and_then(|t| media::frame(&video, t, &out))

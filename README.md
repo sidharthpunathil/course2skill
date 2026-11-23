@@ -122,7 +122,7 @@ The skill writer works in a fixed order: read every transcript and course file i
 
 ## Screenshots
 
-While writing a skill, the AI reads every transcript in full and every course file, notes the moments where the screen shows something the words do not (a tool's settings, a report, a spreadsheet, a results page), captures those frames, looks at each one, retakes it a few seconds either way if it missed, and embeds the good ones in `SKILL.md` and `references/` with a caption and source timestamp. Backends that cannot run commands list the frames they want in `assets/screenshots.tsv`, and course2skill captures them afterwards. Screenshots that no file embeds are removed.
+While writing a skill, the AI reads every transcript in full and every course file, notes the moments where the screen shows something the words do not (a tool's settings, a report, a spreadsheet, a results page), captures as many frames as it needs (every screen state, every walkthrough step), looks at each one, reads the text in it into the notes, retakes it a few seconds either way if it missed, and embeds the good ones in `SKILL.md` and `references/` with a caption and source timestamp. Backends that cannot run commands list the frames they want in `assets/screenshots.tsv`, and course2skill captures them afterwards. Screenshots that no file embeds are removed.
 
 Every skill also has `scripts/frame.sh`:
 

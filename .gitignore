@@ -4,6 +4,12 @@
 /export/
 frames/
 *.wav
+*.mp4
+*.mov
+*.mkv
+*.zip
+knowledge-graph/
+.cache/
 
 # Build
 /target/

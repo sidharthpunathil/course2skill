@@ -30,7 +30,7 @@ pub fn convert(doc: &Path) -> Result<String> {
         "txt" | "md" => std::fs::read_to_string(doc)?,
         other => bail!("unsupported handout type .{other}"),
     };
-    let name = crate::scan::file_name(doc);
+    let name = crate::layout::file_name(doc);
     Ok(format!(
         "---\ntitle: {name:?}\nsource: {:?}\nkind: handout\n---\n\n# {name}\n\n{}\n",
         doc.display().to_string(),

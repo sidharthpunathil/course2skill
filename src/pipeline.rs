@@ -1,18 +1,23 @@
-//! Runs the stages (handouts, transcription, skills) and reports progress as events.
+//! Runs the stages in order and reports progress as events:
+//! 1. handouts to markdown, 2. every video transcribed and saved, 3. skills.
 
+use crate::ai::AiConfig;
 use crate::asr::{Asr, check_setup};
 use crate::chunk::plan_chunks;
-use crate::scan::{Chapter, Course, file_name, file_stem};
+use crate::layout::{Chapter, Course, file_name, file_stem};
 use crate::transcript::{Cache, Piece, render_markdown};
 use crate::{docs, media, skill};
 use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc::Sender;
 use std::thread;
 
-const MAX_CHUNK: f64 = 28.0;
+/// Audio sent to the worker per request. Qwen3-ASR chunks internally; this
+/// size keeps progress moving and bounds what a crash can lose.
+const MAX_CHUNK: f64 = 120.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stages {
@@ -26,12 +31,13 @@ pub enum Stages {
 pub struct Opts {
     pub out: PathBuf,
     pub venv: PathBuf,
-    pub model: PathBuf,
+    pub asr_model: String,
+    pub aligner: String,
     pub chapters: Option<Vec<usize>>,
     pub stages: Stages,
     pub force: bool,
     pub skill_jobs: usize,
-    pub skill_model: Option<String>,
+    pub ai: AiConfig,
     pub silence_db: i32,
     pub silence_min: f64,
 }
@@ -62,6 +68,7 @@ pub enum Event {
         course: String,
         chapters: Vec<ChInfo>,
     },
+    Stage(String),
     Chapter {
         idx: usize,
         state: ChState,
@@ -94,7 +101,7 @@ pub enum Event {
 }
 
 pub fn result_chapter_dir(out: &Path, ch: &Chapter) -> PathBuf {
-    out.join(&ch.name)
+    out.join(&ch.out_rel)
 }
 
 /// Runs the pipeline on the current thread. `stop` aborts between chunks.
@@ -105,7 +112,6 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
     let selected: Vec<usize> = (0..course.chapters.len())
         .filter(|i| opts.chapters.as_ref().is_none_or(|c| c.contains(&(i + 1))))
         .collect();
-
     let do_docs = matches!(
         opts.stages,
         Stages::All | Stages::TranscribeOnly | Stages::DocsOnly
@@ -113,20 +119,20 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
     let do_asr = matches!(opts.stages, Stages::All | Stages::TranscribeOnly);
     let do_skills = matches!(opts.stages, Stages::All | Stages::SkillsOnly);
 
-    let mut infos = Vec::new();
-    for ch in &course.chapters {
-        let secs = ch
-            .videos
-            .iter()
-            .filter_map(|v| media::probe_duration(v).ok())
-            .sum();
-        infos.push(ChInfo {
+    let infos: Vec<ChInfo> = course
+        .chapters
+        .iter()
+        .map(|ch| ChInfo {
             name: ch.name.clone(),
             videos: ch.videos.len(),
             docs: ch.docs.len(),
-            audio_secs: secs,
-        });
-    }
+            audio_secs: ch
+                .videos
+                .iter()
+                .filter_map(|v| media::probe_duration(v).ok())
+                .sum(),
+        })
+        .collect();
     let skipped: f64 = infos
         .iter()
         .enumerate()
@@ -138,47 +144,23 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         chapters: infos,
     });
     send(Event::SkippedAudio { secs: skipped });
-    for (i, _) in course
-        .chapters
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| !selected.contains(i))
-    {
+    for i in (0..course.chapters.len()).filter(|i| !selected.contains(i)) {
         send(Event::Chapter {
             idx: i,
             state: ChState::Done,
         });
     }
-    let mut ok = true;
+    let mut failed: BTreeSet<usize> = BTreeSet::new();
 
-    // Skill writers run in the background while later chapters transcribe.
-    let (skill_tx, skill_rx) = channel::<usize>();
-    let skill_rx = Arc::new(Mutex::new(skill_rx));
-    let failed = Arc::new(AtomicBool::new(false));
-    let mut skill_threads = Vec::new();
-    if do_skills {
-        for _ in 0..opts.skill_jobs.max(1) {
-            let rx = Arc::clone(&skill_rx);
-            let tx = tx.clone();
-            let course = course.clone();
-            let opts = opts.clone();
-            let failed = Arc::clone(&failed);
-            skill_threads.push(thread::spawn(move || {
-                skill_worker(&rx, &tx, &course, &opts, &failed)
-            }));
-        }
-    }
-
-    let mut asr: Option<Asr> = None;
-    for &idx in &selected {
-        if stop.load(Ordering::Relaxed) {
-            break;
-        }
-        let ch = &course.chapters[idx];
-        let dir = result_chapter_dir(&opts.out, ch);
-        std::fs::create_dir_all(&dir)?;
-
-        if do_docs {
+    if do_docs {
+        send(Event::Stage("Handouts".into()));
+        for &idx in &selected {
+            let ch = &course.chapters[idx];
+            let dir = result_chapter_dir(&opts.out, ch);
+            std::fs::create_dir_all(&dir)?;
+            if ch.docs.is_empty() {
+                continue;
+            }
             send(Event::Chapter {
                 idx,
                 state: ChState::Docs,
@@ -196,82 +178,149 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                     Err(e) => send(Event::Error(format!("{}: {e:#}", file_name(doc)))),
                 }
             }
+            send(Event::Chapter {
+                idx,
+                state: ChState::Pending,
+            });
         }
+    }
 
-        if do_asr {
+    if do_asr {
+        send(Event::Stage("Transcribing".into()));
+        let mut asr: Option<Asr> = None;
+        for &idx in &selected {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            let ch = &course.chapters[idx];
+            let dir = result_chapter_dir(&opts.out, ch);
+            std::fs::create_dir_all(&dir)?;
             send(Event::Chapter {
                 idx,
                 state: ChState::Transcribing,
             });
-            let mut chapter_ok = true;
+            let context = context_terms(&course.name, ch, &dir);
             for video in &ch.videos {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 let target = dir.join(format!("{}.md", file_stem(video)));
                 if target.exists() && !opts.force {
-                    send(Event::Log(format!("skip (done) {}", file_name(video))));
+                    send(Event::Log(format!(
+                        "already transcribed: {}",
+                        file_name(video)
+                    )));
                     send(Event::SkippedAudio {
                         secs: media::probe_duration(video).unwrap_or(0.0),
                     });
                     continue;
                 }
                 if asr.is_none() {
-                    send(Event::Log(
-                        "loading ARK-ASR model (first time takes a moment)".into(),
-                    ));
-                    let python = check_setup(&opts.venv, &opts.model)?;
-                    asr = Some(Asr::spawn(&python, &opts.model)?);
-                    send(Event::Log("model ready".into()));
+                    send(Event::Log(format!(
+                        "loading {} + aligner (first run downloads them)",
+                        opts.asr_model
+                    )));
+                    let python = check_setup(&opts.venv)?;
+                    asr = Some(Asr::spawn(&python, &opts.asr_model, &opts.aligner)?);
+                    send(Event::Log("speech model ready".into()));
                 }
                 let Some(engine) = asr.as_mut() else { continue };
-                if let Err(e) = transcribe_video(engine, idx, ch, video, &target, opts, tx, stop) {
-                    chapter_ok = false;
-                    ok = false;
+                if let Err(e) =
+                    transcribe_video(engine, idx, ch, video, &target, &context, opts, tx, stop)
+                {
+                    failed.insert(idx);
                     send(Event::Error(format!("{}: {e:#}", file_name(video))));
                 }
             }
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            if !chapter_ok {
-                send(Event::Chapter {
-                    idx,
-                    state: ChState::Failed,
-                });
-                continue;
-            }
-            send(Event::Chapter {
-                idx,
-                state: ChState::Transcribed,
-            });
+            let state = if failed.contains(&idx) {
+                ChState::Failed
+            } else {
+                ChState::Transcribed
+            };
+            send(Event::Chapter { idx, state });
         }
+        // Free the speech model's memory before the skill stage.
+        drop(asr);
+        if !stop.load(Ordering::Relaxed) {
+            send(Event::Log("all transcripts saved".into()));
+        }
+    }
 
-        if do_skills {
+    let mut skills_failed = false;
+    if do_skills && !stop.load(Ordering::Relaxed) {
+        send(Event::Stage(format!(
+            "Writing skills with {}",
+            opts.ai.backend.label()
+        )));
+        let queue: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|i| !failed.contains(i))
+            .collect();
+        for &idx in &queue {
             send(Event::Chapter {
                 idx,
                 state: ChState::SkillQueued,
             });
-            let _ = skill_tx.send(idx);
-        } else {
+        }
+        let queue = Mutex::new(queue.into_iter());
+        let any_failed = AtomicBool::new(false);
+        thread::scope(|scope| {
+            for _ in 0..opts.skill_jobs.max(1) {
+                scope.spawn(|| skill_worker(&queue, tx, course, opts, stop, &any_failed));
+            }
+        });
+        skills_failed = any_failed.load(Ordering::Relaxed);
+    } else if !do_skills {
+        for &idx in selected.iter().filter(|i| !failed.contains(i)) {
             send(Event::Chapter {
                 idx,
                 state: ChState::Done,
             });
         }
     }
-    // Free the model's memory before waiting on skill writers.
-    drop(asr);
-    drop(skill_tx);
-    for t in skill_threads {
-        let _ = t.join();
-    }
-    let ok = ok && !failed.load(Ordering::Relaxed) && !stop.load(Ordering::Relaxed);
+
+    let ok = failed.is_empty() && !skills_failed && !stop.load(Ordering::Relaxed);
     send(Event::Finished {
         ok,
         out: opts.out.clone(),
     });
     Ok(())
+}
+
+/// Domain words for the speech model: course and unit names plus capitalized
+/// terms from the unit's handouts (tool names, brands, jargon).
+fn context_terms(course: &str, ch: &Chapter, result_dir: &Path) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut add = |w: &str| {
+        let w = w.trim_matches(|c: char| !c.is_alphanumeric());
+        if w.len() > 2
+            && w.chars().next().is_some_and(char::is_uppercase)
+            && seen.insert(w.to_lowercase())
+        {
+            terms.push(w.to_string());
+        }
+    };
+    for w in course
+        .split(['.', ' ', '-', '_'])
+        .chain(ch.name.split([' ', '-', '_', '›']))
+    {
+        add(w);
+    }
+    for doc in &ch.docs {
+        let md = result_dir.join(format!("{}.md", file_stem(doc)));
+        if let Ok(text) = std::fs::read_to_string(md) {
+            for w in text.split_whitespace().take(4000) {
+                add(w);
+            }
+        }
+    }
+    terms.truncate(80);
+    terms.join(" ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -281,15 +330,16 @@ fn transcribe_video(
     ch: &Chapter,
     video: &Path,
     target: &Path,
+    context: &str,
     opts: &Opts,
     tx: &Sender<Event>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let work = opts.out.join(".cache").join(&ch.name);
+    let work = opts.out.join(".cache").join(&ch.out_rel);
     std::fs::create_dir_all(&work)?;
     let stem = file_stem(video);
     let wav = work.join(format!("{stem}.wav"));
-    let mut cache = Cache::load(&work.join(format!("{stem}.json")))?;
+    let mut cache = Cache::load(&work.join(format!("{stem}.qwen.json")))?;
 
     media::extract_wav(video, &wav)?;
     let duration = media::probe_duration(&wav)?;
@@ -310,13 +360,14 @@ fn transcribe_video(
         let (piece, cached) = match cache.get(i) {
             Some(p) if (p.start - span.start).abs() < 0.01 => (p.clone(), true),
             _ => {
-                let text = asr
-                    .transcribe(&wav, *span)
+                let (text, words) = asr
+                    .transcribe(&wav, *span, context)
                     .with_context(|| format!("chunk {i}"))?;
                 let p = Piece {
                     start: span.start,
                     end: span.end,
                     text,
+                    words,
                 };
                 cache.put(i, p.clone())?;
                 (p, false)
@@ -341,18 +392,22 @@ fn transcribe_video(
 }
 
 fn skill_worker(
-    rx: &Mutex<Receiver<usize>>,
+    queue: &Mutex<std::vec::IntoIter<usize>>,
     tx: &Sender<Event>,
     course: &Course,
     opts: &Opts,
-    failed: &AtomicBool,
+    stop: &AtomicBool,
+    any_failed: &AtomicBool,
 ) {
     loop {
-        let next = match rx.lock() {
-            Ok(guard) => guard.recv(),
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let next = match queue.lock() {
+            Ok(mut q) => q.next(),
             Err(_) => return,
         };
-        let Ok(idx) = next else { return };
+        let Some(idx) = next else { return };
         let ch = &course.chapters[idx];
         let skills_root = opts.out.join("skills");
         if skills_root.join(&ch.slug).join("SKILL.md").exists() && !opts.force {
@@ -369,13 +424,7 @@ fn skill_worker(
         });
         let _ = tx.send(Event::Log(format!("writing skill {}", ch.slug)));
         let dir = result_chapter_dir(&opts.out, ch);
-        match skill::synthesize(
-            &course.name,
-            ch,
-            &dir,
-            &skills_root,
-            opts.skill_model.as_deref(),
-        ) {
+        match skill::synthesize(&course.name, ch, &dir, &skills_root, &opts.ai) {
             Ok(p) => {
                 let _ = tx.send(Event::Log(format!("skill ready → {}", p.display())));
                 let _ = tx.send(Event::Chapter {
@@ -384,7 +433,7 @@ fn skill_worker(
                 });
             }
             Err(e) => {
-                failed.store(true, Ordering::Relaxed);
+                any_failed.store(true, Ordering::Relaxed);
                 let _ = tx.send(Event::Error(format!("skill {}: {e:#}", ch.slug)));
                 let _ = tx.send(Event::Chapter {
                     idx,

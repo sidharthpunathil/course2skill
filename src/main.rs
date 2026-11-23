@@ -1,19 +1,23 @@
-//! course2skill: turn a video course into markdown transcripts and agent skills.
+//! course2skill: turn a video course into timestamped transcripts and agent skills.
 
+mod ai;
 mod asr;
 mod chunk;
 mod docs;
+mod layout;
 mod media;
 mod pipeline;
-mod scan;
 mod skill;
 mod transcript;
 mod tui;
+mod wizard;
 
-use anyhow::{Context, Result};
+use ai::{AiConfig, Backend};
+use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
+use layout::LayoutMode;
 use pipeline::{Event, Opts, Stages};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -23,53 +27,76 @@ use std::sync::mpsc::channel;
 #[command(
     name = "course2skill",
     version,
-    about = "Turn a video course into markdown transcripts and one agent skill per chapter"
+    about = "Turn a video course into timestamped transcripts and one agent skill per unit.\nRun with no arguments for the interactive wizard."
 )]
 struct Cli {
     #[command(subcommand)]
-    cmd: Cmd,
+    cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// Handouts, transcription and skills, end to end
+    /// Handouts, then every transcript, then skills (end to end)
     Run(RunArgs),
-    /// Convert handouts and transcribe videos, no skills
+    /// Handouts and transcripts only
     Transcribe(RunArgs),
     /// Convert handouts only
     Docs(RunArgs),
-    /// Write skills from existing results
+    /// Write skills from existing transcripts
     Skills(RunArgs),
+    /// Show how the course will be grouped into units, and save plan.json
+    Plan(RunArgs),
     /// Save one frame of a video: course2skill frame <video> <mm:ss> <out.jpg>
     Frame {
         video: PathBuf,
         at: String,
         out: PathBuf,
     },
-    /// Check that every tool and the speech model are in place
-    Doctor(SetupArgs),
+    /// Install the local speech-to-text environment (uv + mlx-qwen3-asr)
+    Setup(AsrArgs),
+    /// Check tools, AI backends and the speech-to-text environment
+    Doctor(AsrArgs),
 }
 
 #[derive(Args, Clone)]
-struct SetupArgs {
-    /// Python venv with ark_asr_mlx installed [default: ~/.cache/course2skill/.venv]
+struct AsrArgs {
+    /// Python venv with mlx-qwen3-asr [default: ~/.cache/course2skill/qwen-venv]
     #[arg(long)]
     venv: Option<PathBuf>,
-    /// ARK-ASR model folder [default: ~/.cache/course2skill/ark-asr-3B-mlx]
+    /// Speech model (Qwen/Qwen3-ASR-0.6B is ~3x faster, a bit less accurate)
+    #[arg(long, default_value = asr::DEFAULT_MODEL)]
+    asr_model: String,
+    /// Forced aligner used for word timestamps
+    #[arg(long, default_value = asr::DEFAULT_ALIGNER)]
+    aligner: String,
+}
+
+#[derive(Args, Clone)]
+struct AiArgs {
+    /// AI that groups lessons (with --layout ai) and writes the skills
+    #[arg(long, value_enum, default_value_t = Backend::Claude)]
+    ai: Backend,
+    /// Model for that AI (default: the tool's own default)
     #[arg(long)]
-    model: Option<PathBuf>,
+    ai_model: Option<String>,
+    /// Base URL for API and local backends (e.g. http://localhost:1234/v1 for LM Studio)
+    #[arg(long)]
+    ai_url: Option<String>,
 }
 
 #[derive(Args, Clone)]
 struct RunArgs {
-    /// Course folder (or a folder holding one course)
+    /// Course folder, any layout
     course: PathBuf,
     /// Output folder
     #[arg(long, default_value = "result")]
     out: PathBuf,
-    /// Only these chapters, 1-based: "1,3-5"
+    /// How lessons are grouped into units
+    #[arg(long, value_enum, default_value_t = LayoutMode::Auto)]
+    layout: LayoutMode,
+    /// Only these units, 1-based: "1,3-5"
     #[arg(long)]
-    chapters: Option<String>,
+    units: Option<String>,
     /// Redo work that already has output
     #[arg(long)]
     force: bool,
@@ -79,17 +106,26 @@ struct RunArgs {
     /// Skills written in parallel
     #[arg(long, default_value_t = 3)]
     skill_jobs: usize,
-    /// Model passed to `claude --model` for skill writing
-    #[arg(long)]
-    skill_model: Option<String>,
     /// Silence threshold in dB for chunk cuts
     #[arg(long, default_value_t = -35, allow_hyphen_values = true)]
     silence_db: i32,
     #[command(flatten)]
-    setup: SetupArgs,
+    ai: AiArgs,
+    #[command(flatten)]
+    asr: AsrArgs,
 }
 
-fn parse_chapters(s: &str) -> Result<Vec<usize>> {
+impl AiArgs {
+    fn config(&self) -> AiConfig {
+        AiConfig {
+            backend: self.ai,
+            model: self.ai_model.clone(),
+            base_url: self.ai_url.clone(),
+        }
+    }
+}
+
+fn parse_units(s: &str) -> Result<Vec<usize>> {
     let mut out = Vec::new();
     for part in s.split(',').map(str::trim).filter(|p| !p.is_empty()) {
         if let Some((a, b)) = part.split_once('-') {
@@ -98,46 +134,80 @@ fn parse_chapters(s: &str) -> Result<Vec<usize>> {
         } else {
             out.push(
                 part.parse()
-                    .with_context(|| format!("bad chapter {part:?}"))?,
+                    .with_context(|| format!("bad unit number {part:?}"))?,
             );
         }
     }
     Ok(out)
 }
 
-fn paths(setup: &SetupArgs) -> (PathBuf, PathBuf) {
-    let home = asr::default_home();
-    (
-        setup.venv.clone().unwrap_or_else(|| home.join(".venv")),
-        setup
-            .model
-            .clone()
-            .unwrap_or_else(|| home.join("ark-asr-3B-mlx")),
-    )
+fn out_dir(out: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(out)?;
+    Ok(out.canonicalize()?)
 }
 
-fn run_pipeline(args: RunArgs, stages: Stages) -> Result<bool> {
-    let course = scan::scan(&args.course)?;
-    let (venv, model) = paths(&args.setup);
-    std::fs::create_dir_all(&args.out)?;
+fn plan_for(args: &RunArgs) -> Result<layout::Plan> {
+    let out = out_dir(&args.out)?;
+    let (root, files) = layout::inventory(&args.course, std::slice::from_ref(&out))?;
+    wizard::make_plan(&root, &files, args.layout, &args.ai.config(), &out)
+}
+
+fn print_plan(plan: &layout::Plan, out: &Path) {
+    println!(
+        "{} → {} units (plan: {}/plan.json)",
+        plan.course,
+        plan.units.len(),
+        out.display()
+    );
+    for (i, u) in plan.units.iter().enumerate() {
+        let videos = u
+            .files
+            .iter()
+            .filter(|f| layout::kind(Path::new(f)) == Some(layout::Kind::Video))
+            .count();
+        println!(
+            "{:>3}. {}  ({videos} videos, {} handouts) → {}",
+            i + 1,
+            u.name,
+            u.files.len() - videos,
+            u.folder
+        );
+    }
+}
+
+fn run_pipeline(plan: &layout::Plan, args: &RunArgs, stages: Stages) -> Result<bool> {
+    let (course, warnings) = layout::course_from_plan(plan)?;
     let opts = Opts {
-        out: args.out.canonicalize()?,
-        venv,
-        model,
-        chapters: args.chapters.as_deref().map(parse_chapters).transpose()?,
+        out: out_dir(&args.out)?,
+        venv: args.asr.venv.clone().unwrap_or_else(asr::default_venv),
+        asr_model: args.asr.asr_model.clone(),
+        aligner: args.asr.aligner.clone(),
+        chapters: args.units.as_deref().map(parse_units).transpose()?,
         stages,
         force: args.force,
         skill_jobs: args.skill_jobs,
-        skill_model: args.skill_model,
+        ai: args.ai.config(),
         silence_db: args.silence_db,
         silence_min: 0.3,
     };
+    if matches!(stages, Stages::All | Stages::SkillsOnly) {
+        let (ok, why) = opts.ai.backend.availability();
+        if !ok {
+            bail!(
+                "{} is not ready ({why}). Pick another with --ai",
+                opts.ai.backend.label()
+            );
+        }
+    }
     let (tx, rx) = channel::<Event>();
+    for w in warnings {
+        let _ = tx.send(Event::Error(w));
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let worker = {
         let stop = Arc::clone(&stop);
-        let course = course.clone();
         let tx2 = tx.clone();
+        let opts = opts.clone();
         std::thread::spawn(move || {
             if let Err(e) = pipeline::run(&course, &opts, &tx2, &stop) {
                 let _ = tx2.send(Event::Error(format!("{e:#}")));
@@ -155,9 +225,10 @@ fn run_pipeline(args: RunArgs, stages: Stages) -> Result<bool> {
         for ev in rx {
             match ev {
                 Event::Plan { course, chapters } => {
-                    println!("course: {course} ({} chapters)", chapters.len())
+                    println!("course: {course} ({} units)", chapters.len())
                 }
-                Event::Chapter { idx, state } => println!("chapter {}: {state:?}", idx + 1),
+                Event::Stage(s) => println!("── {s} ──"),
+                Event::Chapter { idx, state } => println!("unit {}: {state:?}", idx + 1),
                 Event::VideoStart { name, chunks, .. } => println!("▶ {name} ({chunks} chunks)"),
                 Event::Chunk {
                     done,
@@ -196,45 +267,95 @@ fn run_pipeline(args: RunArgs, stages: Stages) -> Result<bool> {
     Ok(true)
 }
 
-fn doctor(setup: &SetupArgs) -> Result<bool> {
+fn doctor(a: &AsrArgs) -> Result<bool> {
     let mut ok = true;
+    println!("tools");
     for (tool, arg) in [
         ("ffmpeg", "-version"),
         ("ffprobe", "-version"),
         ("pdftotext", "-v"),
         ("pandoc", "--version"),
-        ("claude", "--version"),
+        ("uv", "--version"),
     ] {
         let found = Command::new(tool).arg(arg).output().is_ok();
-        println!("{} {tool}", if found { "✔" } else { "✘" });
+        println!("  {} {tool}", if found { "✔" } else { "✘" });
         ok &= found;
     }
-    let (venv, model) = paths(setup);
-    match asr::check_setup(&venv, &model) {
+    println!("speech to text");
+    match asr::check_setup(&a.venv.clone().unwrap_or_else(asr::default_venv)) {
         Ok(py) => println!(
-            "✔ ASR worker python {}\n✔ model {}",
+            "  ✔ mlx-qwen3-asr in {}\n  · model {} + {}",
             py.display(),
-            model.display()
+            a.asr_model,
+            a.aligner
         ),
         Err(e) => {
-            println!("✘ {e}");
+            println!("  ✘ {e}");
             ok = false;
         }
     }
+    println!("AI backends (need at least one)");
+    for b in ai::ALL {
+        let (ready, why) = b.availability();
+        println!(
+            "  {} {:<22} {why}",
+            if ready { "✔" } else { "·" },
+            b.label()
+        );
+    }
     Ok(ok)
+}
+
+fn wizard_flow() -> Result<bool> {
+    let out = PathBuf::from("result");
+    let Some(choice) = wizard::run(None, &out, None)? else {
+        return Ok(true);
+    };
+    let args = RunArgs {
+        course: choice.plan.root.clone(),
+        out,
+        layout: LayoutMode::Auto,
+        units: None,
+        force: false,
+        plain: false,
+        skill_jobs: 3,
+        silence_db: -35,
+        ai: AiArgs {
+            ai: choice.ai.backend,
+            ai_model: choice.ai.model.clone(),
+            ai_url: choice.ai.base_url.clone(),
+        },
+        asr: AsrArgs {
+            venv: None,
+            asr_model: asr::DEFAULT_MODEL.into(),
+            aligner: asr::DEFAULT_ALIGNER.into(),
+        },
+    };
+    run_pipeline(&choice.plan, &args, Stages::All)
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.cmd {
-        Cmd::Run(a) => run_pipeline(a, Stages::All),
-        Cmd::Transcribe(a) => run_pipeline(a, Stages::TranscribeOnly),
-        Cmd::Docs(a) => run_pipeline(a, Stages::DocsOnly),
-        Cmd::Skills(a) => run_pipeline(a, Stages::SkillsOnly),
-        Cmd::Frame { video, at, out } => media::parse_ts(&at)
+        None => wizard_flow(),
+        Some(Cmd::Run(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::All)),
+        Some(Cmd::Transcribe(a)) => {
+            plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::TranscribeOnly))
+        }
+        Some(Cmd::Docs(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::DocsOnly)),
+        Some(Cmd::Skills(a)) => plan_for(&a).and_then(|p| run_pipeline(&p, &a, Stages::SkillsOnly)),
+        Some(Cmd::Plan(a)) => plan_for(&a).and_then(|p| {
+            print_plan(&p, &out_dir(&a.out)?);
+            Ok(true)
+        }),
+        Some(Cmd::Frame { video, at, out }) => media::parse_ts(&at)
             .and_then(|t| media::frame(&video, t, &out))
             .map(|()| true),
-        Cmd::Doctor(s) => doctor(&s),
+        Some(Cmd::Setup(a)) => asr::setup(&a.venv.unwrap_or_else(asr::default_venv)).map(|py| {
+            println!("ready: {}", py.display());
+            true
+        }),
+        Some(Cmd::Doctor(a)) => doctor(&a),
     };
     match result {
         Ok(true) => ExitCode::SUCCESS,
@@ -251,12 +372,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_chapters_handles_ranges() {
-        assert_eq!(parse_chapters("1,3-5").unwrap(), vec![1, 3, 4, 5]);
+    fn parse_units_handles_ranges() {
+        assert_eq!(parse_units("1,3-5").unwrap(), vec![1, 3, 4, 5]);
     }
 
     #[test]
-    fn parse_chapters_rejects_junk() {
-        assert!(parse_chapters("x").is_err());
+    fn parse_units_rejects_junk() {
+        assert!(parse_units("x").is_err());
     }
 }

@@ -12,8 +12,6 @@ impl Span {
     }
 }
 
-/// Minimum chunk length before we accept a silence as the cut point.
-const MIN_CUT: f64 = 5.0;
 /// Trailing chunks shorter than this get merged into the previous one.
 const MIN_TAIL: f64 = 0.3;
 
@@ -57,7 +55,7 @@ pub fn plan_chunks(duration: f64, silences: &[Span], max: f64) -> Vec<Span> {
         let cut = silences
             .iter()
             .map(|s| (s.start + s.end) / 2.0)
-            .filter(|&mid| mid > cursor + MIN_CUT && mid <= limit)
+            .filter(|&mid| mid > cursor + max / 4.0 && mid <= limit)
             .fold(None, |best: Option<f64>, mid| {
                 Some(best.map_or(mid, |b| b.max(mid)))
             })

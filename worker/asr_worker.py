@@ -1,28 +1,35 @@
-"""course2skill ASR worker.
+"""course2skill ASR worker (Qwen3-ASR on MLX, word timestamps via the forced aligner).
 
-Loads ARK-ASR once, then answers JSON lines on stdin:
-  {"wav": "/path.wav", "start": 0.0, "end": 27.5}
+argv: <asr model> <aligner model>
+Prints {"ready": true} once both models are loaded, then answers JSON lines on stdin:
+  {"wav": "/path.wav", "start": 0.0, "end": 118.2, "context": "terms"}
 with one JSON line on stdout:
-  {"text": "..."} or {"error": "..."}
+  {"text": "...", "words": [["word", start, end], ...]}   (times relative to "start")
+or {"error": "..."}.
 """
 
 import json
+import os
 import sys
 
 
 def reply(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
+    sys.__stdout__.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.__stdout__.flush()
 
 
 def main():
-    model_path = sys.argv[1]
+    asr_name, aligner_name = sys.argv[1], sys.argv[2]
+    # Keep library chatter (download bars, warnings) off the protocol channel.
+    sys.stdout = sys.stderr
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     try:
         import numpy as np
         import soundfile as sf
-        from ark_asr_mlx import ArkASR
+        import mlx_qwen3_asr as qasr
 
-        asr = ArkASR.from_pretrained(model_path)
+        model, _config = qasr.load_model(asr_name)
+        aligner = qasr.ForcedAligner(aligner_name)
     except Exception as error:  # report load failures to the parent
         reply({"fatal": f"{type(error).__name__}: {error}"})
         return 1
@@ -43,11 +50,22 @@ def main():
             a = max(0, int(req["start"] * rate))
             b = min(len(audio), int(req["end"] * rate))
             clip = np.ascontiguousarray(audio[a:b])
-            if len(clip) < rate // 10 or float(np.abs(clip).max(initial=0.0)) < 1e-4:
-                reply({"text": ""})
+            if len(clip) < rate // 5 or float(np.abs(clip).max(initial=0.0)) < 1e-4:
+                reply({"text": "", "words": []})
                 continue
-            result = asr.transcribe(clip, sample_rate=rate, max_new_tokens=int(req.get("max_tokens", 384)))
-            reply({"text": result.text.strip()})
+            result = qasr.transcribe(
+                (clip, rate),
+                model=model,
+                forced_aligner=aligner,
+                return_timestamps=True,
+                language=req.get("language") or "English",
+                context=req.get("context", ""),
+            )
+            words = [
+                [str(s.get("text", "")), float(s.get("start", 0.0)), float(s.get("end", 0.0))]
+                for s in (result.segments or [])
+            ]
+            reply({"text": (result.text or "").strip(), "words": words})
         except Exception as error:
             reply({"error": f"{type(error).__name__}: {error}"})
     return 0

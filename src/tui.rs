@@ -28,6 +28,7 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 struct App {
     course: String,
+    stage: String,
     chapters: Vec<ChInfo>,
     states: Vec<ChState>,
     current_chapter: Option<usize>,
@@ -49,6 +50,7 @@ impl App {
     fn new() -> App {
         App {
             course: String::from("scanning…"),
+            stage: String::from("Starting"),
             chapters: Vec::new(),
             states: Vec::new(),
             current_chapter: None,
@@ -124,6 +126,10 @@ impl App {
                 }
             }
             Event::VideoDone => {}
+            Event::Stage(s) => {
+                self.log(false, format!("── {s} ──"));
+                self.stage = s;
+            }
             Event::SkippedAudio { secs } => self.total_audio = (self.total_audio - secs).max(0.0),
             Event::Log(m) => self.log(false, m),
             Event::Error(m) => self.log(true, m),
@@ -241,6 +247,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             app.course.as_str(),
             Style::default().fg(FG).add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  │ ", Style::default().fg(BORDER)),
+        Span::styled(app.stage.as_str(), Style::default().fg(WARM).bold()),
     ]);
     f.render_widget(Paragraph::new(title), title_row);
 
@@ -276,7 +284,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         stat("speed", format!("{speed:.1}× realtime")),
         stat("eta", eta),
         stat("elapsed", fmt_ts(app.started.elapsed().as_secs_f64())),
-        stat("chapters", format!("{skills_done}/{}", app.chapters.len())),
+        stat(
+            "units done",
+            format!("{skills_done}/{}", app.chapters.len()),
+        ),
     ]);
     f.render_widget(Paragraph::new(stats), stats_row);
 }
@@ -334,7 +345,7 @@ fn draw_chapters(f: &mut Frame, area: Rect, app: &App) {
             ListItem::new(vec![line1, line2])
         })
         .collect();
-    f.render_widget(List::new(items).block(panel("Chapters", ACCENT)), area);
+    f.render_widget(List::new(items).block(panel("Units", ACCENT)), area);
 }
 
 fn draw_now(f: &mut Frame, area: Rect, app: &App) {

@@ -66,7 +66,7 @@ enum Cmd {
 #[derive(Args, Clone)]
 struct ExportArgs {
     /// Where to put the export
-    #[arg(long)]
+    #[arg(long, default_value = "export")]
     to: PathBuf,
     /// Base output folder the runs live in
     #[arg(long, default_value = "result")]

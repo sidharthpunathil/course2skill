@@ -85,6 +85,7 @@ Press `q` to stop the TUI. Running agent CLIs are stopped too. Finished chunks a
 ## Share or install the skills
 
 ```sh
+course2skill export                                   # into ./export (the default)
 course2skill export --to ~/Desktop/share              # the whole package for a friend or another agent
 course2skill export --to ~/Desktop/share --zip        # plus one zip per skill and one for the course
 course2skill export --to ~/.claude/skills --flat      # install the skills straight into Claude Code

@@ -1,6 +1,7 @@
 # Course content and generated output
 /course/
 /result/
+/export/
 frames/
 *.wav
 

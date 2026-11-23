@@ -1,6 +1,6 @@
 # course2skill
 
-course2skill turns a folder of course videos into timestamped markdown transcripts, then into one agent skill per unit. Transcription runs locally on Apple Silicon with Qwen3-ASR. An AI of your choice writes the skills.
+course2skill turns a course folder into timestamped markdown transcripts of every video, plus a copy of every other course file, then into one agent skill per unit. Transcription runs locally on Apple Silicon with Qwen3-ASR. An AI of your choice writes the skills.
 
 ## What it produces
 
@@ -11,7 +11,7 @@ result/
     plan.json                  how files were grouped into units (editable)
     01-Introduction/
       Video_01-Welcome_to_Compact_Keywords.md   transcript, a [mm:ss] on every sentence
-      01-Welcome to Compact Keywords.md         handout converted to markdown
+      01-Welcome to Compact Keywords.pdf        course files copied as-is
     skills/
       01-introduction/
         SKILL.md
@@ -21,9 +21,9 @@ result/
   latest -> 2026-11-23_06-30-10
 ```
 
-Each run gets a new timestamped folder. Transcribed audio is cached in `result/.cache`, so a later run reuses it and only redoes the skills.
+Each run gets a new timestamped folder. Transcribed audio is cached in `result/.cache`, keyed by the video's path in the course and the speech model, so a later run reuses it. If the latest run did not finish, running the same command continues it; `--new` starts a fresh one.
 
-The stages run in order: handouts are converted, then every video is transcribed and saved, then the skills are written.
+The stages run in order: course files are copied, then every video is transcribed and saved, then the skills are written. Only videos become markdown. PDFs, spreadsheets, documents, images and anything else are copied unchanged.
 
 ## Requirements
 
@@ -53,8 +53,8 @@ course2skill
 Or use subcommands:
 
 ```sh
-course2skill run course/                    # handouts, transcripts, then skills
-course2skill transcribe course/             # handouts and transcripts only
+course2skill run course/                    # copy files, transcripts, then skills
+course2skill transcribe course/             # copy files and transcripts only
 course2skill skills course/ --ai codex      # skills from the latest run's transcripts
 course2skill plan course/ --layout ai       # preview the unit grouping
 course2skill frame video.mp4 03:10 shot.jpg
@@ -69,11 +69,13 @@ Useful flags:
 | `--ai-url URL` | Base URL for API and local backends |
 | `--layout auto\|folders\|ai` | How lessons are grouped into units |
 | `--units 1,3-5` | Only some units |
-| `--run latest\|NAME` | Continue an existing run instead of starting a new one |
+| `--run latest\|NAME` | Continue a specific run |
+| `--new` | Start a new run even if the latest one did not finish |
+| `--language NAME` | Spoken language (default `English`, `auto` to detect) |
 | `--asr-model Qwen/Qwen3-ASR-0.6B` | Faster, slightly less accurate speech model |
 | `--plain` | Log lines instead of the TUI |
 
-Press `q` to stop the TUI. Finished chunks are cached, so running the same command again picks up where it stopped.
+Press `q` to stop the TUI. Running agent CLIs are stopped too. Finished chunks are cached and the run folder is kept, so running the same command again picks up where it stopped.
 
 ## Course layouts
 
@@ -98,13 +100,13 @@ course2skill finds videos and handouts at any depth. With `--layout auto` (the d
 | OpenAI-compatible API | `/chat/completions` | `OPENAI_API_KEY`, optional `OPENAI_BASE_URL` |
 | Local model | Ollama, LM Studio or `mlx_lm.server` | `--ai-url` or `LOCAL_AI_BASE_URL` (default `http://localhost:11434/v1`) |
 
-The coding CLIs work in the skill folder with copies of the transcripts and the original handouts, so they can open PDFs directly. The API and local backends get the material in the prompt and return the files as text blocks, which course2skill writes out. When an API base URL points somewhere other than the provider's own host, the key is also sent as `Authorization: Bearer`.
+The coding CLIs work in the skill folder with copies of the transcripts and the original course files, so they can open PDFs and images directly, plus temporary text extractions of PDFs, DOCX and XLSX. The API and local backends get the transcripts and those text extractions in the prompt and return the files as text blocks, which course2skill writes out. The extractions are deleted afterwards; nothing converted is kept in the results. A skill folder gets a `.complete` marker when it is finished, and an unfinished one is redone on the next run. When an API base URL points somewhere other than the provider's own host, the key is also sent as `Authorization: Bearer`.
 
 ## How transcription works
 
 1. ffmpeg extracts 16 kHz mono audio.
 2. `silencedetect` finds pauses, and the audio is cut into pieces of up to two minutes at those pauses.
-3. A Python worker keeps Qwen3-ASR and the forced aligner loaded. It transcribes each piece with the course name, the unit name and terms from the unit's handouts as context, which helps with tool names and jargon.
+3. A Python worker keeps Qwen3-ASR and the forced aligner loaded. It transcribes each piece with the course name, the unit name and terms read from the unit's documents as context, which helps with tool names and jargon. If the worker crashes, the next video starts a fresh one.
 4. Each piece is cached as soon as it finishes. The transcript is written once the whole video is done, with the time of the first word at the start of every sentence.
 
 On an M-series Mac the 1.7B model runs at roughly 0.15 to 0.2 times real time, so a 10-hour course takes about 2 hours.
@@ -118,7 +120,7 @@ scripts/frame.sh "Video_01-Getting_Technical.mp4" 09:11          # one frame
 scripts/frame.sh "Video_01-Getting_Technical.mp4" 09:00 10:00 10 # one every 10 s
 ```
 
-Frames are saved to `./frames/`. Because each transcript sentence has its own timestamp, an agent reading a skill can jump to the exact moment a tool or slide is on screen.
+Frames are saved to `./frames/`. A bare file name is looked up anywhere under the unit's source folder. Because each transcript sentence has its own timestamp, an agent reading a skill can jump to the exact moment a tool or slide is on screen.
 
 ## Development
 

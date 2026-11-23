@@ -82,6 +82,9 @@ fn cell_text(d: &Data) -> String {
     }
 }
 
+/// Data rows kept per sheet before the rest are omitted.
+const MAX_ROWS: usize = 150;
+
 /// Renders rows as a GFM table. The first non-empty row is the header.
 pub fn rows_to_table(rows: &[Vec<String>]) -> String {
     let rows: Vec<&Vec<String>> = rows
@@ -105,13 +108,37 @@ pub fn rows_to_table(rows: &[Vec<String>]) -> String {
             c.trim().replace('|', "\\|").replace(['\n', '\r'], " ")
         })
     };
-    let mut md = String::new();
-    for (n, r) in rows.iter().enumerate() {
+    let render = |r: &Vec<String>| -> String {
         let cells: Vec<String> = (0..width).map(|i| cell(r, i)).collect();
-        let _ = writeln!(md, "| {} |", cells.join(" | "));
-        if n == 0 {
-            let _ = writeln!(md, "|{}", "---|".repeat(width));
+        format!("| {} |\n", cells.join(" | "))
+    };
+    let mut md = render(rows[0]);
+    let _ = writeln!(md, "|{}", "---|".repeat(width));
+    // Templates ship thousands of identical placeholder rows: collapse runs, cap the rest.
+    let mut emitted = 0;
+    let mut i = 1;
+    while i < rows.len() {
+        let line = render(rows[i]);
+        let mut run = 1;
+        while i + run < rows.len() && render(rows[i + run]) == line {
+            run += 1;
         }
+        if emitted >= MAX_ROWS {
+            let left = rows.len() - i;
+            let _ = writeln!(md, "\n_({left} more rows omitted, see the original file)_");
+            break;
+        }
+        md.push_str(&line);
+        emitted += 1;
+        if run > 1 {
+            let _ = writeln!(
+                md,
+                "| _(same row repeated {} more times)_ |{}",
+                run - 1,
+                " |".repeat(width - 1)
+            );
+        }
+        i += run;
     }
     md
 }
@@ -132,6 +159,28 @@ mod tests {
             row(&["x|y", "z", ""]),
         ]);
         assert_eq!(t, "| A | B |\n|---|---|\n| x\\|y | z |\n");
+    }
+
+    #[test]
+    fn identical_rows_collapse() {
+        let rows = vec![
+            row(&["H", "I"]),
+            row(&["No", "0"]),
+            row(&["No", "0"]),
+            row(&["No", "0"]),
+        ];
+        assert_eq!(
+            rows_to_table(&rows),
+            "| H | I |\n|---|---|\n| No | 0 |\n| _(same row repeated 2 more times)_ | |\n"
+        );
+    }
+
+    #[test]
+    fn long_sheets_are_capped() {
+        let mut rows = vec![row(&["H"])];
+        rows.extend((0..400).map(|i| row(&[&i.to_string()])));
+        let t = rows_to_table(&rows);
+        assert!(t.contains("250 more rows omitted"), "{t}");
     }
 
     #[test]

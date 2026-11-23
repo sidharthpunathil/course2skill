@@ -54,7 +54,7 @@ The entry point an LLM reads first. It must let the reader act correctly without
   - `## Course files`: what is in `assets/files/` and when to open each one; for templates, how to fill them in, column by column.
   - `## Reference files`: a list linking every file in `references/` (including each lesson-notes file) with one line on when to open it.
 - Keep `SKILL.md` focused and actionable (aim for under 500 lines); when something needs more room, give the short version in `SKILL.md` and the full version in a topic reference, and link to it. Never drop it.
-- Embed screenshots as `![What it shows](assets/screenshots/name.jpg)` followed by a one-line italic caption with the source, e.g. `*Google Search Console, Pages report (Video_01-Getting_Technical.mp4 [09:12])*`.
+- Embed screenshots as `![What it shows](assets/screenshots/v2-09m12s-tool-what-it-shows.jpg)` followed by a one-line italic caption with the source, e.g. `*Google Search Console, Pages report (Video_01-Getting_Technical.mp4 [09:12])*`.
 - Cite where facts come from as `(Video_..._video2.mp4 [12:34])` or `(file: name.pdf)`, so every claim can be checked.
 
 ### 3. `references/<topic>.md` (as many as the section needs)

@@ -1,5 +1,16 @@
 # course2skill design
 
+## Revisions (same day, from user feedback)
+
+- Speech to text is Qwen3-ASR 1.7B via mlx-qwen3-asr with the Qwen3 forced aligner, not ARK-ASR. Every transcript sentence carries the time it is spoken, for precise screenshots.
+- Order is strict: handouts, then every transcript saved, then skills as the final step.
+- The skill-writing AI is selectable: Claude Code, Codex, opencode, Gemini CLI, Antigravity, Anthropic API, OpenAI-compatible API, or a local OpenAI-compatible server.
+- Courses can have any layout. Files are found at any depth and grouped into units by folder heuristics or by the chosen AI, saved as an editable `plan.json`.
+- Each generation is written to `result/<timestamp>/` with a `latest` link; the speech cache in `result/.cache/` is shared across runs.
+- Running with no arguments opens a setup wizard.
+
+The sections below are the original design; where they conflict with this list, this list wins.
+
 ## Intent
 
 Turn a video course on disk into agent skills. Every lesson video gets transcribed locally. Each chapter becomes a markdown folder, and then one consolidated agent skill that holds everything the chapter teaches. The first course is Edward Sturm's Compact Keywords (14 chapters, 37 videos, 9.8 hours, plus PDF, DOCX and XLSX handouts).

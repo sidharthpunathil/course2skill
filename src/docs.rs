@@ -1,0 +1,141 @@
+//! Converts chapter handouts (PDF, DOCX, PPTX, XLSX, text) to markdown.
+
+use anyhow::{Context, Result, bail};
+use calamine::{Data, Reader, open_workbook_auto};
+use std::fmt::Write as _;
+use std::path::Path;
+use std::process::Command;
+
+pub fn convert(doc: &Path) -> Result<String> {
+    let ext = doc
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let body = match ext.as_str() {
+        "pdf" => tool_output(
+            Command::new("pdftotext")
+                .args(["-layout", "-enc", "UTF-8"])
+                .arg(doc)
+                .arg("-"),
+            "pdftotext",
+        )?,
+        "docx" | "pptx" => tool_output(
+            Command::new("pandoc")
+                .args(["-t", "gfm", "--wrap=none"])
+                .arg(doc),
+            "pandoc",
+        )?,
+        "xlsx" => xlsx_to_md(doc)?,
+        "txt" | "md" => std::fs::read_to_string(doc)?,
+        other => bail!("unsupported handout type .{other}"),
+    };
+    let name = crate::scan::file_name(doc);
+    Ok(format!(
+        "---\ntitle: {name:?}\nsource: {:?}\nkind: handout\n---\n\n# {name}\n\n{}\n",
+        doc.display().to_string(),
+        body.trim_end()
+    ))
+}
+
+fn tool_output(cmd: &mut Command, tool: &str) -> Result<String> {
+    let out = cmd
+        .output()
+        .with_context(|| format!("could not start {tool} (is it installed?)"))?;
+    if !out.status.success() {
+        bail!(
+            "{tool} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn xlsx_to_md(path: &Path) -> Result<String> {
+    let mut wb = open_workbook_auto(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut md = String::new();
+    for name in wb.sheet_names() {
+        let range = wb
+            .worksheet_range(&name)
+            .with_context(|| format!("reading sheet {name}"))?;
+        let rows: Vec<Vec<String>> = range
+            .rows()
+            .map(|r| r.iter().map(cell_text).collect())
+            .collect();
+        let _ = writeln!(md, "## Sheet: {name}\n");
+        let table = rows_to_table(&rows);
+        md.push_str(if table.is_empty() {
+            "_(empty sheet)_\n"
+        } else {
+            &table
+        });
+        md.push('\n');
+    }
+    Ok(md)
+}
+
+fn cell_text(d: &Data) -> String {
+    match d {
+        Data::Empty => String::new(),
+        Data::Float(f) if f.fract() == 0.0 && f.abs() < 1e15 => format!("{}", *f as i64),
+        other => other.to_string(),
+    }
+}
+
+/// Renders rows as a GFM table. The first non-empty row is the header.
+pub fn rows_to_table(rows: &[Vec<String>]) -> String {
+    let rows: Vec<&Vec<String>> = rows
+        .iter()
+        .filter(|r| r.iter().any(|c| !c.trim().is_empty()))
+        .collect();
+    let width = rows
+        .iter()
+        .map(|r| {
+            r.iter()
+                .rposition(|c| !c.trim().is_empty())
+                .map_or(0, |i| i + 1)
+        })
+        .max()
+        .unwrap_or(0);
+    if rows.is_empty() || width == 0 {
+        return String::new();
+    }
+    let cell = |r: &Vec<String>, i: usize| -> String {
+        r.get(i).map_or(String::new(), |c| {
+            c.trim().replace('|', "\\|").replace(['\n', '\r'], " ")
+        })
+    };
+    let mut md = String::new();
+    for (n, r) in rows.iter().enumerate() {
+        let cells: Vec<String> = (0..width).map(|i| cell(r, i)).collect();
+        let _ = writeln!(md, "| {} |", cells.join(" | "));
+        if n == 0 {
+            let _ = writeln!(md, "|{}", "---|".repeat(width));
+        }
+    }
+    md
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn table_escapes_pipes_and_trims_empty() {
+        let t = rows_to_table(&[
+            row(&["A", "B", ""]),
+            row(&["", "", ""]),
+            row(&["x|y", "z", ""]),
+        ]);
+        assert_eq!(t, "| A | B |\n|---|---|\n| x\\|y | z |\n");
+    }
+
+    #[test]
+    fn empty_rows_give_empty_table() {
+        assert_eq!(rows_to_table(&[row(&["", " "])]), "");
+    }
+}

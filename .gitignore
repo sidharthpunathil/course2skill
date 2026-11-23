@@ -1,0 +1,5 @@
+/course/
+/result/
+/target/
+.DS_Store
+*.wav

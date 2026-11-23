@@ -79,6 +79,7 @@ Useful flags:
 | `--language NAME` | Spoken language (default `English`, `auto` to detect) |
 | `--asr-model Qwen/Qwen3-ASR-0.6B` | Faster, slightly less accurate speech model |
 | `--plain` | Log lines instead of the TUI |
+| `--skill-jobs N` | Skills written at once (default 5; limited by your AI plan's rate) |
 
 Press `q` to stop the TUI. Running agent CLIs are stopped too. Finished chunks are cached and the run folder is kept, so running the same command again picks up where it stopped.
 
@@ -130,6 +131,14 @@ On an M-series Mac the 1.7B model runs at roughly 0.15 to 0.2 times real time, s
 ## What goes into a skill
 
 The skill writer works in a fixed order: read every transcript and course file in full, capture screenshots, write complete lesson notes for every video (every step, number, tool, setting, example, warning, opinion, tip, trick, shortcut, aside and resource, in order with timestamps), then write `SKILL.md` as a playbook another LLM can act on, plus topic references and `references/resources.md`. Last, it re-reads every transcript and file to check each detail made it in, adds what is missing, and records the result in `references/coverage.md`.
+
+## What runs in parallel
+
+- Video lengths are probed in parallel.
+- While the GPU transcribes one video, a second thread prepares the next one (audio extraction, silence detection, chunk plan), and two more threads find scene changes for the screenshot stage on spare CPU.
+- Any scene scans still missing after transcription run on about half the CPU cores.
+- graphify extracts the knowledge graph with parallel subagents.
+- Skills are written 5 at a time (`--skill-jobs`), and in sections with 3 or more videos the skill writer hands each video's lesson notes to its own subagent, then reviews them all before writing `SKILL.md`.
 
 ## Screenshots
 

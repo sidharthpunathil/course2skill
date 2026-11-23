@@ -188,7 +188,7 @@ fn track(pid: u32, add: bool) {
 
 /// Tools Claude Code may use while writing a skill: file tools, the frame
 /// grabber and graphify queries.
-const SKILL_TOOLS: &str = "Read,Write,Edit,Glob,Grep,Skill,Bash(scripts/frame.sh:*),Bash(./scripts/frame.sh:*),Bash(bash scripts/frame.sh:*),Bash(ls:*),Bash(graphify query:*),Bash(graphify explain:*),Bash(graphify path:*)";
+const SKILL_TOOLS: &str = "Read,Write,Edit,Glob,Grep,Skill,Agent,Task,Bash(scripts/frame.sh:*),Bash(./scripts/frame.sh:*),Bash(bash scripts/frame.sh:*),Bash(ls:*),Bash(graphify query:*),Bash(graphify explain:*),Bash(graphify path:*)";
 
 /// Runs an agent CLI with write access in `cwd`. Returns its final message.
 pub fn run_agent(cfg: &AiConfig, prompt: &str, cwd: &Path) -> Result<String> {

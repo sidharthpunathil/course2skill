@@ -128,20 +128,26 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
     let do_asr = matches!(opts.stages, Stages::All | Stages::TranscribeOnly);
     let do_skills = matches!(opts.stages, Stages::All | Stages::SkillsOnly);
 
-    let infos: Vec<ChInfo> = course
-        .chapters
-        .iter()
-        .map(|ch| ChInfo {
-            name: ch.name.clone(),
-            videos: ch.videos.len(),
-            docs: ch.docs.len(),
-            audio_secs: ch
-                .videos
-                .iter()
-                .filter_map(|v| media::probe_duration(v).ok())
-                .sum(),
-        })
-        .collect();
+    // Video lengths, probed in parallel (one thread per unit).
+    let infos: Vec<ChInfo> = thread::scope(|scope| {
+        let handles: Vec<_> = course
+            .chapters
+            .iter()
+            .map(|ch| {
+                scope.spawn(move || ChInfo {
+                    name: ch.name.clone(),
+                    videos: ch.videos.len(),
+                    docs: ch.docs.len(),
+                    audio_secs: ch
+                        .videos
+                        .iter()
+                        .filter_map(|v| media::probe_duration(v).ok())
+                        .sum(),
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
     let skipped: f64 = infos
         .iter()
         .enumerate()
@@ -198,23 +204,15 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
 
     if do_asr {
         send(Event::Stage("Transcribing".into()));
-        let mut asr: Option<Asr> = None;
+        // Videos still to transcribe, in course order; finished ones are skipped here.
+        let mut jobs: Vec<Job> = Vec::new();
+        let mut remaining: Vec<usize> = vec![0; course.chapters.len()];
         for &idx in &selected {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
             let ch = &course.chapters[idx];
             let dir = result_chapter_dir(&opts.out, ch);
             std::fs::create_dir_all(&dir)?;
-            send(Event::Chapter {
-                idx,
-                state: ChState::Transcribing,
-            });
-            let context = context_terms(&course.name, ch);
+            let mut context: Option<std::sync::Arc<String>> = None;
             for (video, name) in ch.videos.iter().zip(&ch.transcript_names) {
-                if stop.load(Ordering::Relaxed) {
-                    break;
-                }
                 let target = dir.join(format!("{name}.md"));
                 if target.exists() && !opts.force {
                     send(Event::Log(format!(
@@ -226,58 +224,120 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
                     });
                     continue;
                 }
-                if asr.is_none() {
-                    send(Event::Log(format!(
-                        "loading {} + aligner (first run downloads them)",
-                        opts.asr_model
-                    )));
-                    let python = check_setup(&opts.venv)?;
-                    asr = Some(Asr::spawn(
-                        &python,
-                        &opts.asr_model,
-                        &opts.aligner,
-                        &opts.language,
-                    )?);
-                    send(Event::Log("speech model ready".into()));
-                }
-                let Some(engine) = asr.as_mut() else { continue };
-                let cache = cache_base(&opts.cache, &course.root, video, &opts.asr_model);
-                let mut done_secs = 0.0;
-                if let Err(e) = transcribe_video(
-                    engine,
+                let context = context
+                    .get_or_insert_with(|| std::sync::Arc::new(context_terms(&course.name, ch)))
+                    .clone();
+                remaining[idx] += 1;
+                jobs.push(Job {
                     idx,
-                    video,
-                    &cache,
-                    &target,
-                    &context,
-                    opts,
-                    tx,
-                    stop,
-                    &mut done_secs,
-                ) {
-                    // Take the rest of this video out of the progress total.
-                    let total = media::probe_duration(video).unwrap_or(done_secs);
+                    video: video.clone(),
+                    target,
+                    cache: cache_base(&opts.cache, &course.root, video, &opts.asr_model),
+                    context,
+                });
+            }
+            if remaining[idx] == 0 {
+                send(Event::Chapter {
+                    idx,
+                    state: ChState::Transcribed,
+                });
+            }
+        }
+
+        let scan_videos: Vec<&PathBuf> = if do_skills {
+            selected
+                .iter()
+                .flat_map(|&i| &course.chapters[i].videos)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let scan_queue = Mutex::new(scan_videos.into_iter());
+        let failed_asr = Mutex::new(BTreeSet::new());
+        thread::scope(|scope| -> Result<()> {
+            // Scene detection is CPU work; run it now, while the GPU transcribes.
+            for _ in 0..SCAN_THREADS_DURING_ASR {
+                scope.spawn(|| scan_worker(&scan_queue, opts, stop, &send));
+            }
+            // Prepare the next video's audio (extract, silences, chunk plan) ahead of the GPU.
+            let (prep_tx, prep_rx) = std::sync::mpsc::sync_channel::<(Job, Result<Prepared>)>(1);
+            let jobs_ref = &jobs;
+            scope.spawn(move || {
+                for job in jobs_ref {
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let prepared = prepare(job, opts);
+                    if prep_tx.send((job.clone(), prepared)).is_err() {
+                        return;
+                    }
+                }
+            });
+
+            let mut asr: Option<Asr> = None;
+            let mut started: BTreeSet<usize> = BTreeSet::new();
+            for (job, prepared) in prep_rx {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if started.insert(job.idx) {
+                    send(Event::Chapter {
+                        idx: job.idx,
+                        state: ChState::Transcribing,
+                    });
+                }
+                let mut done_secs = 0.0;
+                let result = prepared.and_then(|p| {
+                    if asr.is_none() {
+                        send(Event::Log(format!(
+                            "loading {} + aligner (first run downloads them)",
+                            opts.asr_model
+                        )));
+                        let python = check_setup(&opts.venv)?;
+                        asr = Some(Asr::spawn(
+                            &python,
+                            &opts.asr_model,
+                            &opts.aligner,
+                            &opts.language,
+                        )?);
+                        send(Event::Log("speech model ready".into()));
+                    }
+                    let engine = asr.as_mut().context("speech model not loaded")?;
+                    transcribe_prepared(engine, &job, &p, tx, stop, &mut done_secs)
+                });
+                if let Err(e) = result {
+                    let total = media::probe_duration(&job.video).unwrap_or(done_secs);
                     send(Event::SkippedAudio {
                         secs: (total - done_secs).max(0.0),
                     });
-                    failed.insert(idx);
-                    send(Event::Error(format!("{}: {e:#}", file_name(video))));
+                    if let Ok(mut f) = failed_asr.lock() {
+                        f.insert(job.idx);
+                    }
+                    send(Event::Error(format!("{}: {e:#}", file_name(&job.video))));
                     // The worker may have died; start a fresh one for the next video.
                     asr = None;
                 }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                remaining[job.idx] -= 1;
+                if remaining[job.idx] == 0 {
+                    let bad = failed_asr.lock().is_ok_and(|f| f.contains(&job.idx));
+                    send(Event::Chapter {
+                        idx: job.idx,
+                        state: if bad {
+                            ChState::Failed
+                        } else {
+                            ChState::Transcribed
+                        },
+                    });
+                }
             }
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let state = if failed.contains(&idx) {
-                ChState::Failed
-            } else {
-                ChState::Transcribed
-            };
-            send(Event::Chapter { idx, state });
-        }
-        // Free the speech model's memory before the skill stage.
-        drop(asr);
+            // Free the speech model's memory before the skill stage.
+            drop(asr);
+            Ok(())
+        })?;
+        failed.extend(failed_asr.into_inner().unwrap_or_default());
         if !stop.load(Ordering::Relaxed) {
             send(Event::Log("all transcripts saved".into()));
         }
@@ -301,7 +361,8 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         }
     }
 
-    // Scene changes for every video, 4 at a time, so skill writers never wait.
+    // Scene changes for every video (most were found during transcription and
+    // come from the cache), so skill writers never wait.
     if do_skills && !stop.load(Ordering::Relaxed) {
         let videos: Vec<&PathBuf> = selected
             .iter()
@@ -313,28 +374,8 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         )));
         let queue = Mutex::new(videos.into_iter());
         thread::scope(|scope| {
-            for _ in 0..4 {
-                scope.spawn(|| {
-                    loop {
-                        if stop.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        let Some(v) = queue.lock().ok().and_then(|mut q| q.next()) else {
-                            return;
-                        };
-                        match crate::visual::cached_scenes(&opts.cache, v) {
-                            Ok(sc) => send(Event::Log(format!(
-                                "{} screen changes in {}",
-                                sc.len(),
-                                file_name(v)
-                            ))),
-                            Err(e) => send(Event::Error(format!(
-                                "scene detection {}: {e:#}",
-                                file_name(v)
-                            ))),
-                        }
-                    }
-                });
+            for _ in 0..scan_threads() {
+                scope.spawn(|| scan_worker(&queue, opts, stop, &send));
             }
         });
     }
@@ -441,66 +482,95 @@ fn cache_base(cache: &Path, root: &Path, video: &Path, model: &str) -> PathBuf {
         .join(format!("{}.{tag}", file_stem(video)))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn transcribe_video(
-    asr: &mut Asr,
+/// One video waiting to be transcribed.
+#[derive(Clone)]
+struct Job {
     idx: usize,
-    video: &Path,
-    cache_base: &Path,
-    target: &Path,
-    context: &str,
-    opts: &Opts,
+    video: PathBuf,
+    target: PathBuf,
+    cache: PathBuf,
+    context: std::sync::Arc<String>,
+}
+
+/// A video's audio, ready for the speech model.
+struct Prepared {
+    wav: PathBuf,
+    duration: f64,
+    spans: Vec<crate::chunk::Span>,
+}
+
+/// Scene-detection threads that run alongside transcription (the GPU does the
+/// speech work, so a few CPU cores are free).
+const SCAN_THREADS_DURING_ASR: usize = 2;
+
+/// Scene-detection threads when nothing else is running: about half the cores,
+/// since each ffmpeg uses more than one.
+fn scan_threads() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| (n.get() / 2).clamp(2, 8))
+}
+
+/// Appends an extension (the cache base ends in the model tag, e.g. `.qwen`).
+fn with_ext(base: &Path, ext: &str) -> PathBuf {
+    PathBuf::from(format!("{}.{ext}", base.display()))
+}
+
+fn prepare(job: &Job, opts: &Opts) -> Result<Prepared> {
+    if let Some(dir) = job.cache.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let wav = with_ext(&job.cache, "wav");
+    media::extract_wav(&job.video, &wav)?;
+    let duration = media::probe_duration(&wav)?;
+    let silences = media::detect_silences(&wav, opts.silence_db, opts.silence_min)?;
+    Ok(Prepared {
+        wav,
+        duration,
+        spans: plan_chunks(duration, &silences, MAX_CHUNK),
+    })
+}
+
+fn transcribe_prepared(
+    asr: &mut Asr,
+    job: &Job,
+    p: &Prepared,
     tx: &Sender<Event>,
     stop: &AtomicBool,
     done_secs: &mut f64,
 ) -> Result<()> {
-    if let Some(dir) = cache_base.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let stem = file_stem(video);
-    // Append (not replace) extensions: the base ends in the model tag, e.g. `.qwen`.
-    let with_ext = |ext: &str| PathBuf::from(format!("{}.{ext}", cache_base.display()));
-    let wav = with_ext("wav");
-    let mut cache = Cache::load(&with_ext("json"))?;
-
-    media::extract_wav(video, &wav)?;
-    let duration = media::probe_duration(&wav)?;
-    let silences = media::detect_silences(&wav, opts.silence_db, opts.silence_min)?;
-    let spans = plan_chunks(duration, &silences, MAX_CHUNK);
+    let mut cache = Cache::load(&with_ext(&job.cache, "json"))?;
     let _ = tx.send(Event::VideoStart {
-        idx,
-        name: file_name(video),
-        chunks: spans.len(),
-        duration,
+        idx: job.idx,
+        name: file_name(&job.video),
+        chunks: p.spans.len(),
+        duration: p.duration,
     });
-
-    let mut pieces = Vec::with_capacity(spans.len());
-    for (i, span) in spans.iter().enumerate() {
+    let mut pieces = Vec::with_capacity(p.spans.len());
+    for (i, span) in p.spans.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
         }
         let (piece, cached) = match cache.get(i) {
-            Some(p) if (p.start - span.start).abs() < 0.01 && (p.end - span.end).abs() < 0.01 => {
-                (p.clone(), true)
+            Some(c) if (c.start - span.start).abs() < 0.01 && (c.end - span.end).abs() < 0.01 => {
+                (c.clone(), true)
             }
             _ => {
                 let (text, words) = asr
-                    .transcribe(&wav, *span, context)
+                    .transcribe(&p.wav, *span, &job.context)
                     .with_context(|| format!("chunk {i}"))?;
-                let p = Piece {
+                let piece = Piece {
                     start: span.start,
                     end: span.end,
                     text,
                     words,
                 };
-                cache.put(i, p.clone())?;
-                (p, false)
+                cache.put(i, piece.clone())?;
+                (piece, false)
             }
         };
         *done_secs += span.len();
         let _ = tx.send(Event::Chunk {
             done: i + 1,
-            total: spans.len(),
+            total: p.spans.len(),
             audio_secs: span.len(),
             start: span.start,
             text: piece.text.clone(),
@@ -508,12 +578,40 @@ fn transcribe_video(
         });
         pieces.push(piece);
     }
+    let stem = file_stem(&job.video);
     let title = stem.trim_start_matches("Video_").replace('_', " ");
-    let md = render_markdown(&title, video, duration, &pieces);
-    std::fs::write(target, skill::strip_invisible(&md))?;
-    let _ = std::fs::remove_file(&wav);
+    let md = render_markdown(&title, &job.video, p.duration, &pieces);
+    std::fs::write(&job.target, skill::strip_invisible(&md))?;
+    let _ = std::fs::remove_file(&p.wav);
     let _ = tx.send(Event::VideoDone);
     Ok(())
+}
+
+fn scan_worker(
+    queue: &Mutex<std::vec::IntoIter<&PathBuf>>,
+    opts: &Opts,
+    stop: &AtomicBool,
+    send: &(dyn Fn(Event) + Sync),
+) {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(v) = queue.lock().ok().and_then(|mut q| q.next()) else {
+            return;
+        };
+        match crate::visual::cached_scenes(&opts.cache, v) {
+            Ok(sc) => send(Event::Log(format!(
+                "{} screen changes in {}",
+                sc.len(),
+                file_name(v)
+            ))),
+            Err(e) => send(Event::Error(format!(
+                "scene detection {}: {e:#}",
+                file_name(v)
+            ))),
+        }
+    }
 }
 
 fn skill_worker(

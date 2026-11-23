@@ -150,8 +150,8 @@ struct RunArgs {
     /// Skip the graphify knowledge graph built before the skills
     #[arg(long)]
     no_graph: bool,
-    /// Skills written in parallel
-    #[arg(long, default_value_t = 3)]
+    /// Skills written in parallel (limited by your AI plan's rate, not this machine)
+    #[arg(long, default_value_t = 5)]
     skill_jobs: usize,
     /// Silence threshold in dB for chunk cuts
     #[arg(long, default_value_t = -35, allow_hyphen_values = true)]
@@ -490,7 +490,7 @@ fn wizard_flow() -> Result<bool> {
         units: None,
         force: false,
         plain: false,
-        skill_jobs: 3,
+        skill_jobs: 5,
         silence_db: -35,
         ai: AiArgs {
             ai: choice.ai.backend,

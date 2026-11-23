@@ -45,6 +45,8 @@ pub struct Opts {
     pub silence_min: f64,
     /// Forced transcription language; empty lets the model detect it.
     pub language: String,
+    /// Build a graphify knowledge graph before writing skills.
+    pub graph: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -281,6 +283,24 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         }
     }
 
+    // Knowledge graph of the whole course, used by every skill writer.
+    let mut graph_json: Option<PathBuf> = None;
+    if do_skills && opts.graph && !stop.load(Ordering::Relaxed) {
+        match crate::graph::builder(&opts.ai) {
+            Ok(b) => {
+                send(Event::Stage("Building knowledge graph (graphify)".into()));
+                match crate::graph::build(course, &opts.out, &b, &opts.ai) {
+                    Ok(g) => {
+                        send(Event::Log(format!("knowledge graph → {}", g.display())));
+                        graph_json = Some(g);
+                    }
+                    Err(e) => send(Event::Error(format!("knowledge graph skipped: {e:#}"))),
+                }
+            }
+            Err(why) => send(Event::Log(format!("knowledge graph skipped: {why}"))),
+        }
+    }
+
     let mut skills_failed = false;
     if do_skills && !stop.load(Ordering::Relaxed) {
         send(Event::Stage(format!(
@@ -302,7 +322,17 @@ pub fn run(course: &Course, opts: &Opts, tx: &Sender<Event>, stop: &AtomicBool) 
         let any_failed = AtomicBool::new(false);
         thread::scope(|scope| {
             for _ in 0..opts.skill_jobs.max(1) {
-                scope.spawn(|| skill_worker(&queue, tx, course, opts, stop, &any_failed));
+                scope.spawn(|| {
+                    skill_worker(
+                        &queue,
+                        tx,
+                        course,
+                        opts,
+                        stop,
+                        &any_failed,
+                        graph_json.as_deref(),
+                    )
+                });
             }
         });
         skills_failed = any_failed.load(Ordering::Relaxed);
@@ -455,6 +485,7 @@ fn skill_worker(
     opts: &Opts,
     stop: &AtomicBool,
     any_failed: &AtomicBool,
+    graph: Option<&Path>,
 ) {
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -481,7 +512,7 @@ fn skill_worker(
         });
         let _ = tx.send(Event::Log(format!("writing skill {}", ch.slug)));
         let dir = result_chapter_dir(&opts.out, ch);
-        match skill::synthesize(&course.name, ch, &dir, &skills_root, &opts.ai) {
+        match skill::synthesize(&course.name, ch, &dir, &skills_root, &opts.ai, graph) {
             Ok((p, notes)) => {
                 for n in notes {
                     let _ = tx.send(Event::Log(n));

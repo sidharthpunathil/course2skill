@@ -169,6 +169,7 @@ pub fn synthesize(
     result_chapter_dir: &Path,
     skills_root: &Path,
     ai_cfg: &AiConfig,
+    graph: Option<&Path>,
 ) -> Result<(PathBuf, Vec<String>)> {
     let m = chapter_material(chapter, result_chapter_dir);
     if m.transcripts.is_empty() && m.files.is_empty() {
@@ -206,7 +207,7 @@ pub fn synthesize(
         let names: Vec<String> = texts.iter().map(|(n, _)| n.clone()).collect();
         let result = ai::run_agent(
             ai_cfg,
-            &agent_prompt(course, chapter, &m, &names),
+            &with_graph(agent_prompt(course, chapter, &m, &names), graph, true),
             &skill_dir,
         );
         let _ = std::fs::remove_dir_all(&stage);
@@ -230,7 +231,14 @@ pub fn synthesize(
             .map(|f| file_name(f))
             .filter(|n| !texts.iter().any(|(t, _)| t == n))
             .collect();
-        let answer = ai::complete(ai_cfg, &text_prompt(course, chapter, &inline, &unreadable))?;
+        let answer = ai::complete(
+            ai_cfg,
+            &with_graph(
+                text_prompt(course, chapter, &inline, &unreadable),
+                graph,
+                false,
+            ),
+        )?;
         let files = ai::parse_file_blocks(&answer);
         if !files.iter().any(|(p, _)| p == "SKILL.md") {
             std::fs::write(skill_dir.join("_raw_answer.md"), &answer)?;
@@ -254,6 +262,21 @@ pub fn synthesize(
     clean_tree(&skill_dir)?;
     std::fs::write(skill_dir.join(COMPLETE), "")?;
     Ok((skill_dir, notes))
+}
+
+/// Adds the knowledge-graph instructions after the inputs section.
+fn with_graph(prompt: String, graph: Option<&Path>, agent: bool) -> String {
+    match graph {
+        Some(g) => prompt.replacen(
+            "\n## How to work",
+            &format!(
+                "\n## Course knowledge graph\n\n{}\n\n## How to work",
+                crate::graph::prompt_section(g, agent)
+            ),
+            1,
+        ),
+        None => prompt,
+    }
 }
 
 /// Captures screenshots listed in `assets/screenshots.tsv` that do not exist yet.

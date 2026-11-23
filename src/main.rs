@@ -4,6 +4,7 @@ mod ai;
 mod asr;
 mod chunk;
 mod docs;
+mod graph;
 mod layout;
 mod media;
 mod pipeline;
@@ -117,6 +118,9 @@ struct RunArgs {
     /// Plain log output instead of the TUI
     #[arg(long)]
     plain: bool,
+    /// Skip the graphify knowledge graph built before the skills
+    #[arg(long)]
+    no_graph: bool,
     /// Skills written in parallel
     #[arg(long, default_value_t = 3)]
     skill_jobs: usize,
@@ -293,6 +297,7 @@ fn run_pipeline(
         ai: args.ai.config(),
         silence_db: args.silence_db,
         silence_min: 0.3,
+        graph: !args.no_graph,
         language: if args.asr.language.eq_ignore_ascii_case("auto") {
             String::new()
         } else {
@@ -426,6 +431,7 @@ fn wizard_flow() -> Result<bool> {
         out: out.clone(),
         run: None,
         new: true,
+        no_graph: false,
         layout: LayoutMode::Auto,
         units: None,
         force: false,

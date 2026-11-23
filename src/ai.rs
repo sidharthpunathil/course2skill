@@ -154,7 +154,7 @@ pub fn complete(cfg: &AiConfig, prompt: &str) -> Result<String> {
         Backend::Openai | Backend::Local => openai_compatible(cfg, prompt),
         _ => {
             let scratch = tempfile::tempdir()?;
-            run_cli(cfg, prompt, scratch.path(), false)
+            run_cli(cfg, prompt, scratch.path(), false, None)
         }
     }
 }
@@ -186,15 +186,35 @@ fn track(pid: u32, add: bool) {
     }
 }
 
+/// Tools Claude Code may use while writing a skill: file tools, the frame
+/// grabber and graphify queries.
+const SKILL_TOOLS: &str = "Read,Write,Edit,Glob,Grep,Skill,Bash(scripts/frame.sh:*),Bash(./scripts/frame.sh:*),Bash(bash scripts/frame.sh:*),Bash(ls:*),Bash(graphify query:*),Bash(graphify explain:*),Bash(graphify path:*)";
+
 /// Runs an agent CLI with write access in `cwd`. Returns its final message.
 pub fn run_agent(cfg: &AiConfig, prompt: &str, cwd: &Path) -> Result<String> {
+    run_agent_with_tools(cfg, prompt, cwd, SKILL_TOOLS)
+}
+
+/// Like `run_agent`, with an explicit Claude Code tool allowlist.
+pub fn run_agent_with_tools(
+    cfg: &AiConfig,
+    prompt: &str,
+    cwd: &Path,
+    claude_tools: &str,
+) -> Result<String> {
     if !cfg.backend.is_agent() {
         bail!("{} cannot edit files; use complete()", cfg.backend.label());
     }
-    run_cli(cfg, prompt, cwd, true)
+    run_cli(cfg, prompt, cwd, true, Some(claude_tools))
 }
 
-fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<String> {
+fn run_cli(
+    cfg: &AiConfig,
+    prompt: &str,
+    cwd: &Path,
+    write: bool,
+    claude_tools: Option<&str>,
+) -> Result<String> {
     let bin = cfg.backend.binary().unwrap_or_default();
     let mut cmd = Command::new(bin);
     cmd.current_dir(cwd);
@@ -208,7 +228,7 @@ fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<Stri
                     "--permission-mode",
                     "acceptEdits",
                     "--allowedTools",
-                    "Read,Write,Edit,Glob,Grep,Skill,Bash(scripts/frame.sh:*),Bash(./scripts/frame.sh:*),Bash(bash scripts/frame.sh:*),Bash(ls:*)",
+                    claude_tools.unwrap_or(SKILL_TOOLS),
                 ]);
             } else {
                 cmd.args(["--allowedTools", "Read,Glob,Grep"]);

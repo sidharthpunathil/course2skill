@@ -5,7 +5,6 @@
 use crate::layout::{self, file_name};
 use crate::skill::COMPLETE;
 use anyhow::{Context, Result, bail};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -107,15 +106,12 @@ pub fn export(o: &ExportOpts) -> Result<Summary> {
                 }
             }
         }
-        std::fs::write(
-            dest.join("README.md"),
-            index_readme(
-                &plan.course,
-                &descriptions,
-                !o.skills_only,
-                dest.join("knowledge-graph").exists(),
-            ),
-        )?;
+        let sections: Vec<(String, String)> = course
+            .chapters
+            .iter()
+            .map(|c| (c.slug.clone(), c.name.clone()))
+            .collect();
+        crate::kb::write(&dest, &plan.course, &sections)?;
     }
 
     let mut zips = Vec::new();
@@ -267,40 +263,6 @@ fn skill_description(skill_md: &Path) -> String {
         }
     }
     out
-}
-
-fn index_readme(
-    course: &str,
-    skills: &[(String, String, String)],
-    with_course: bool,
-    with_graph: bool,
-) -> String {
-    let mut md = format!(
-        "# {course}: agent skills\n\nOne skill per course section, made with course2skill. Each skill folder is self-contained: `SKILL.md` (the playbook), `references/` (complete lesson notes for every video, templates, resources, coverage audit), `assets/screenshots/` (frames from the videos) and `assets/files/` (the section's original course files).\n\n## Skills\n\n| Skill | Section | What it covers |\n|---|---|---|\n"
-    );
-    for (slug, name, desc) in skills {
-        let short: String = desc.chars().take(220).collect();
-        let more = if desc.chars().count() > 220 {
-            "..."
-        } else {
-            ""
-        };
-        let _ = writeln!(
-            md,
-            "| [`{slug}`](skills/{slug}/SKILL.md) | {name} | {}{more} |",
-            short.replace('|', "\\|")
-        );
-    }
-    md.push_str(
-        "\n## Install\n\nCopy the skill folders you want into your agent's skills folder:\n\n```sh\n# Claude Code (all projects)\ncp -R skills/* ~/.claude/skills/\n\n# Claude Code (one project)\nmkdir -p .claude/skills && cp -R skills/* .claude/skills/\n\n# Codex\nmkdir -p ~/.codex/skills && cp -R skills/* ~/.codex/skills/\n```\n\nOther agents: point them at a skill's `SKILL.md`; it links everything else by relative path.\n\n## Screenshots and the source videos\n\nScreenshots are already included. Each skill also has `scripts/frame.sh` to grab more frames, which needs the original course videos: `COURSE_VIDEO_DIR=/path/to/course scripts/frame.sh \"<video file>\" 03:10`.\n",
-    );
-    if with_course {
-        md.push_str("\n## Course content\n\n`course/` holds every section's video transcripts (each sentence starts with its `[mm:ss]` time in the video) and the original course files.\n");
-    }
-    if with_graph {
-        md.push_str("\n## Knowledge graph\n\n`knowledge-graph/` is a graphify graph of the whole course: open `graph.html` in a browser, read `GRAPH_REPORT.md` for the main concepts and how sections connect, or query `graph.json` with `graphify query \"<question>\" --graph knowledge-graph/graph.json`.\n");
-    }
-    md
 }
 
 fn zip(cwd: &Path, name: &str, out: &Path, exclude: Option<&str>) -> Result<()> {

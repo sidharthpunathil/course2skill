@@ -6,6 +6,7 @@ mod chunk;
 mod docs;
 mod export;
 mod graph;
+mod kb;
 mod layout;
 mod media;
 mod pipeline;

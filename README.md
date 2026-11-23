@@ -13,11 +13,13 @@ result/
       Video_01-Welcome_to_Compact_Keywords.md   transcript, a [mm:ss] on every sentence
       01-Welcome to Compact Keywords.pdf        course files copied as-is
     skills/
-      01-introduction/
-        SKILL.md
-        references/*.md
-        sources.md             every video and handout, with full paths
-        scripts/frame.sh       screenshots from the source video
+      01-introduction/         one skill per section
+        SKILL.md               the playbook, with screenshots embedded
+        references/*.md        templates, walkthroughs, checklists, glossary
+        assets/screenshots/    frames the AI picked from the videos and checked
+        assets/files/          the section's course files, as-is
+        sources.md             every video, transcript and file
+        scripts/frame.sh       grab more frames from the source videos
   latest -> 2026-11-23_06-30-10
 ```
 
@@ -114,14 +116,16 @@ On an M-series Mac the 1.7B model runs at roughly 0.15 to 0.2 times real time, s
 
 ## Screenshots
 
-Every skill has `scripts/frame.sh`:
+While writing a skill, the AI reads every transcript in full and every course file, notes the moments where the screen shows something the words do not (a tool's settings, a report, a spreadsheet, a results page), captures those frames, looks at each one, retakes it a few seconds either way if it missed, and embeds the good ones in `SKILL.md` and `references/` with a caption and source timestamp. Backends that cannot run commands list the frames they want in `assets/screenshots.tsv`, and course2skill captures them afterwards. Screenshots that no file embeds are removed.
+
+Every skill also has `scripts/frame.sh`:
 
 ```sh
 scripts/frame.sh "Video_01-Getting_Technical.mp4" 09:11          # one frame
 scripts/frame.sh "Video_01-Getting_Technical.mp4" 09:00 10:00 10 # one every 10 s
 ```
 
-Frames are saved to `./frames/`. A bare file name is looked up anywhere under the unit's source folder. Because each transcript sentence has its own timestamp, an agent reading a skill can jump to the exact moment a tool or slide is on screen.
+Frames are saved to the skill's `assets/screenshots/`; pass a third argument like `settings.jpg` to name one. A bare video name is looked up anywhere under the section's source folder. Because each transcript sentence has its own timestamp, an agent reading a skill can jump to the exact moment a tool or slide is on screen.
 
 ## Development
 

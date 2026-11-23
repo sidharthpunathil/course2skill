@@ -208,7 +208,7 @@ fn run_cli(cfg: &AiConfig, prompt: &str, cwd: &Path, write: bool) -> Result<Stri
                     "--permission-mode",
                     "acceptEdits",
                     "--allowedTools",
-                    "Read,Write,Edit,Glob,Grep,Skill",
+                    "Read,Write,Edit,Glob,Grep,Skill,Bash(scripts/frame.sh:*),Bash(./scripts/frame.sh:*),Bash(bash scripts/frame.sh:*),Bash(ls:*)",
                 ]);
             } else {
                 cmd.args(["--allowedTools", "Read,Glob,Grep"]);

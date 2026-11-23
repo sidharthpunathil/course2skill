@@ -58,12 +58,19 @@ pub fn chapter_material(chapter: &Chapter, result_chapter_dir: &Path) -> Materia
     Material { transcripts, files }
 }
 
-fn fill(course: &str, chapter: &Chapter, inputs: &str, output: &str) -> String {
+const MANIFEST: &str = "assets/screenshots.tsv";
+
+const AGENT_SCREENSHOTS: &str = "Run `scripts/frame.sh \"<video file>\" <mm:ss> <descriptive-name>.jpg` for each visual moment. It saves the frame into `assets/screenshots/` and prints the path. Open every screenshot you take and check that it shows what you need. If it caught a transition, the wrong screen or the presenter's face, try a few seconds earlier or later, or grab a short range with `scripts/frame.sh \"<video file>\" <from> <to> 2` and keep the clearest frame. Screenshots you do not embed are removed automatically afterwards. Embed the ones that genuinely help someone do the work, usually 5 to 25 per section. If you cannot run commands, list each screenshot you want in `assets/screenshots.tsv` instead, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`; they are captured after you finish.";
+
+const TEXT_SCREENSHOTS: &str = "You cannot watch the video, so choose moments from the transcripts where the screen most likely shows something useful (the sentence is spoken while it is on screen, so pick a time one or two seconds after the sentence starts). List them in a file block for `assets/screenshots.tsv`, one per line as `name.jpg<TAB>video file<TAB>mm:ss<TAB>what it shows`. They are captured after you reply, so embed them in SKILL.md by the names you chose.";
+
+fn fill(course: &str, chapter: &Chapter, inputs: &str, screenshots: &str, output: &str) -> String {
     PROMPT_TEMPLATE
         .replace("{{COURSE}}", course)
         .replace("{{CHAPTER}}", &chapter.name)
         .replace("{{SLUG}}", &chapter.slug)
         .replace("{{INPUTS}}", inputs.trim_end())
+        .replace("{{SCREENSHOTS}}", screenshots)
         .replace("{{OUTPUT}}", output)
 }
 
@@ -77,9 +84,9 @@ pub fn agent_prompt(course: &str, chapter: &Chapter, m: &Material, as_text: &[St
         let _ = writeln!(inputs, "- `{STAGE}/transcripts/{}`", file_name(t));
     }
     if !m.files.is_empty() {
-        inputs.push_str("\nCourse files (handouts, templates, slides, images), as the instructor shared them:\n");
+        inputs.push_str("\nCourse files (handouts, templates, slides, images), as the instructor shared them, already copied into the skill:\n");
         for f in &m.files {
-            let _ = writeln!(inputs, "- `{STAGE}/files/{}`", file_name(f));
+            let _ = writeln!(inputs, "- `assets/files/{}`", file_name(f));
         }
     }
     if !as_text.is_empty() {
@@ -88,8 +95,8 @@ pub fn agent_prompt(course: &str, chapter: &Chapter, m: &Material, as_text: &[St
             let _ = writeln!(inputs, "- `{STAGE}/files-as-text/{n}.md`");
         }
     }
-    let output = "Write the skill files into the current working folder (`SKILL.md`, `references/...`). Do not modify anything under `.input/`. When you are done, reply with one line listing the files you wrote.";
-    fill(course, chapter, &inputs, output)
+    let output = "Write the skill files into the current working folder (`SKILL.md`, `references/...`, screenshots in `assets/screenshots/`). Do not modify anything under `.input/`. When you are done, reply with one line: how many screenshots you kept and the files you wrote.";
+    fill(course, chapter, &inputs, AGENT_SCREENSHOTS, output)
 }
 
 /// Prompt for text-only backends: material is inlined and files come back as blocks.
@@ -117,8 +124,8 @@ pub fn text_prompt(
             unreadable.join(", ")
         );
     }
-    let output = "## Output format\n\nReply with the files only, each wrapped exactly like this, and nothing outside the blocks:\n\n=== FILE: SKILL.md ===\n(file content)\n=== END FILE ===\n=== FILE: references/topic-name.md ===\n(file content)\n=== END FILE ===\n";
-    fill(course, chapter, &inputs, output)
+    let output = "## Output format\n\nReply with the files only, each wrapped exactly like this, and nothing outside the blocks:\n\n=== FILE: SKILL.md ===\n(file content)\n=== END FILE ===\n=== FILE: references/topic-name.md ===\n(file content)\n=== END FILE ===\n=== FILE: assets/screenshots.tsv ===\n(one screenshot per line)\n=== END FILE ===\n";
+    fill(course, chapter, &inputs, TEXT_SCREENSHOTS, output)
 }
 
 fn sources_md(chapter: &Chapter, m: &Material) -> String {
@@ -130,9 +137,9 @@ fn sources_md(chapter: &Chapter, m: &Material) -> String {
     for t in &m.transcripts {
         let _ = writeln!(md, "- `{}`", t.display());
     }
-    md.push_str("\n## Course files (copied as-is)\n\n");
+    md.push_str("\n## Course files (copied as-is into assets/files/)\n\n");
     for f in &m.files {
-        let _ = writeln!(md, "- `{}`", f.display());
+        let _ = writeln!(md, "- `assets/files/{}`", file_name(f));
     }
     md
 }
@@ -154,14 +161,15 @@ fn files_as_text(files: &[PathBuf]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Writes scaffolding, has the chosen AI author the skill, then cleans the text.
+/// Writes scaffolding, has the chosen AI author the skill, captures requested
+/// screenshots, then cleans up. Returns the skill folder and notes for the log.
 pub fn synthesize(
     course: &str,
     chapter: &Chapter,
     result_chapter_dir: &Path,
     skills_root: &Path,
     ai_cfg: &AiConfig,
-) -> Result<PathBuf> {
+) -> Result<(PathBuf, Vec<String>)> {
     let m = chapter_material(chapter, result_chapter_dir);
     if m.transcripts.is_empty() && m.files.is_empty() {
         bail!("unit {} has no transcripts or files yet", chapter.name);
@@ -173,6 +181,13 @@ pub fn synthesize(
     }
     std::fs::create_dir_all(skill_dir.join("scripts"))?;
     std::fs::create_dir_all(skill_dir.join("references"))?;
+    std::fs::create_dir_all(skill_dir.join("assets/screenshots"))?;
+    if !m.files.is_empty() {
+        std::fs::create_dir_all(skill_dir.join("assets/files"))?;
+        for f in &m.files {
+            std::fs::copy(f, skill_dir.join("assets/files").join(file_name(f)))?;
+        }
+    }
     std::fs::write(skill_dir.join("sources.md"), sources_md(chapter, &m))?;
     let frame = skill_dir.join("scripts/frame.sh");
     std::fs::write(
@@ -234,9 +249,101 @@ pub fn synthesize(
             std::fs::write(target, body)?;
         }
     }
+    let mut notes = capture_requested(chapter, &skill_dir);
+    notes.extend(tidy_screenshots(&skill_dir)?);
     clean_tree(&skill_dir)?;
     std::fs::write(skill_dir.join(COMPLETE), "")?;
-    Ok(skill_dir)
+    Ok((skill_dir, notes))
+}
+
+/// Captures screenshots listed in `assets/screenshots.tsv` that do not exist yet.
+fn capture_requested(chapter: &Chapter, skill_dir: &Path) -> Vec<String> {
+    let mut notes = Vec::new();
+    let Ok(manifest) = std::fs::read_to_string(skill_dir.join(MANIFEST)) else {
+        return notes;
+    };
+    let mut captured = 0;
+    for line in manifest
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+    {
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        let [name, video, at, ..] = cols.as_slice() else {
+            notes.push(format!("{}: bad screenshot line {line:?}", chapter.slug));
+            continue;
+        };
+        let name = file_name(Path::new(name));
+        let out = skill_dir.join("assets/screenshots").join(&name);
+        if out.exists() {
+            continue;
+        }
+        let Some(src) = chapter
+            .videos
+            .iter()
+            .find(|v| file_name(v) == *video || crate::layout::file_stem(v) == *video)
+        else {
+            notes.push(format!(
+                "{}: screenshot {name}: unknown video {video:?}",
+                chapter.slug
+            ));
+            continue;
+        };
+        match crate::media::parse_ts(at).and_then(|t| crate::media::frame(src, t, &out)) {
+            Ok(()) => captured += 1,
+            Err(e) => notes.push(format!("{}: screenshot {name}: {e:#}", chapter.slug)),
+        }
+    }
+    if captured > 0 {
+        notes.push(format!(
+            "{}: captured {captured} requested screenshots",
+            chapter.slug
+        ));
+    }
+    notes
+}
+
+/// Removes screenshots no markdown file uses, and reports image links that point nowhere.
+fn tidy_screenshots(skill_dir: &Path) -> Result<Vec<String>> {
+    let mut text = String::new();
+    collect_md(skill_dir, &mut text)?;
+    let mut notes = Vec::new();
+    let shots = skill_dir.join("assets/screenshots");
+    let mut kept = 0;
+    for entry in std::fs::read_dir(&shots)? {
+        let p = entry?.path();
+        let name = file_name(&p);
+        if text.contains(&format!("screenshots/{name}")) {
+            kept += 1;
+        } else {
+            std::fs::remove_file(&p)?;
+        }
+    }
+    for link in text
+        .split("](")
+        .skip(1)
+        .filter_map(|rest| rest.split(')').next())
+    {
+        if let Some(name) = link.split("assets/screenshots/").nth(1)
+            && !shots.join(name).exists()
+        {
+            notes.push(format!("{}: missing image {name}", file_name(skill_dir)));
+        }
+    }
+    notes.push(format!("{}: {kept} screenshots", file_name(skill_dir)));
+    Ok(notes)
+}
+
+fn collect_md(dir: &Path, out: &mut String) -> Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let p = entry?.path();
+        if p.is_dir() && file_name(&p) != STAGE {
+            collect_md(&p, out)?;
+        } else if p.extension().is_some_and(|e| e == "md") {
+            out.push_str(&std::fs::read_to_string(&p)?);
+            out.push('\n');
+        }
+    }
+    Ok(())
 }
 
 fn stage_inputs(stage: &Path, m: &Material, texts: &[(String, String)]) -> Result<()> {
@@ -244,12 +351,6 @@ fn stage_inputs(stage: &Path, m: &Material, texts: &[(String, String)]) -> Resul
     std::fs::create_dir_all(stage.join("transcripts"))?;
     for t in &m.transcripts {
         std::fs::copy(t, stage.join("transcripts").join(file_name(t)))?;
-    }
-    if !m.files.is_empty() {
-        std::fs::create_dir_all(stage.join("files"))?;
-        for f in &m.files {
-            std::fs::copy(f, stage.join("files").join(file_name(f)))?;
-        }
     }
     if !texts.is_empty() {
         std::fs::create_dir_all(stage.join("files-as-text"))?;
@@ -264,7 +365,7 @@ fn stage_inputs(stage: &Path, m: &Material, texts: &[(String, String)]) -> Resul
 fn safe_output(skill_dir: &Path, rel: &str) -> Option<PathBuf> {
     let p = Path::new(rel.trim());
     let ok = p.components().all(|c| matches!(c, Component::Normal(_)))
-        && p.extension().is_some_and(|e| e == "md")
+        && (p.extension().is_some_and(|e| e == "md") || p == Path::new(MANIFEST))
         && p != Path::new("sources.md");
     ok.then(|| skill_dir.join(p))
 }
@@ -332,7 +433,8 @@ mod tests {
         let p = agent_prompt("C", &chapter(), &material(), &["a.pdf".into()]);
         assert!(p.contains("name: 05-on-page-seo"));
         assert!(p.contains(".input/transcripts/Video_01.md"));
-        assert!(p.contains(".input/files/a.pdf"));
+        assert!(p.contains("assets/files/a.pdf"));
+        assert!(p.contains("scripts/frame.sh \"<video file>\" <mm:ss>"));
         assert!(p.contains(".input/files-as-text/a.pdf.md"));
         assert!(p.contains("scripts/frame.sh"));
         assert!(!p.contains("{{"));
@@ -352,6 +454,27 @@ mod tests {
     }
 
     #[test]
+    fn tidy_drops_unused_and_reports_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path().join("skill");
+        std::fs::create_dir_all(d.join("assets/screenshots")).unwrap();
+        std::fs::write(d.join("assets/screenshots/used.jpg"), b"x").unwrap();
+        std::fs::write(d.join("assets/screenshots/unused.jpg"), b"x").unwrap();
+        std::fs::write(
+            d.join("SKILL.md"),
+            "![a](assets/screenshots/used.jpg) ![b](assets/screenshots/gone.jpg)",
+        )
+        .unwrap();
+        let notes = tidy_screenshots(&d).unwrap();
+        assert!(d.join("assets/screenshots/used.jpg").exists());
+        assert!(!d.join("assets/screenshots/unused.jpg").exists());
+        assert!(
+            notes.iter().any(|n| n.contains("missing image gone.jpg")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
     fn single_quote_escapes_quotes_and_dollars_stay_literal() {
         assert_eq!(
             sh_single_quote("/a/Make $10k/it's"),
@@ -367,5 +490,6 @@ mod tests {
         assert!(safe_output(d, "/etc/x.md").is_none());
         assert!(safe_output(d, "scripts/frame.sh").is_none());
         assert!(safe_output(d, "sources.md").is_none());
+        assert!(safe_output(d, "assets/screenshots.tsv").is_some());
     }
 }

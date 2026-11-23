@@ -482,7 +482,10 @@ fn skill_worker(
         let _ = tx.send(Event::Log(format!("writing skill {}", ch.slug)));
         let dir = result_chapter_dir(&opts.out, ch);
         match skill::synthesize(&course.name, ch, &dir, &skills_root, &opts.ai) {
-            Ok(p) => {
+            Ok((p, notes)) => {
+                for n in notes {
+                    let _ = tx.send(Event::Log(n));
+                }
                 let _ = tx.send(Event::Log(format!("skill ready → {}", p.display())));
                 let _ = tx.send(Event::Chapter {
                     idx,

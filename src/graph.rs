@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 pub const DIR: &str = "knowledge-graph";
+const GRAPH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(40 * 60);
 
 /// How the graph gets built on this machine, if at all.
 #[derive(Debug, Clone, PartialEq)]
@@ -140,19 +141,29 @@ pub fn build(course: &Course, run: &Path, builder: &Builder, ai_cfg: &AiConfig) 
         Builder::ClaudeSkill => {
             let flags = if existing.is_some() { " --update" } else { "" };
             let prompt = format!(
-                "/graphify corpus --wiki{flags}\n\nThis is a video course: each folder under corpus/ is one section with its video transcripts (markdown with [mm:ss] timestamps) and the instructor's course files. Build the knowledge graph without asking questions. Do not edit anything under corpus/."
+                "/graphify corpus --wiki{flags}\n\nThis is a video course: each folder under corpus/ is one section with its video transcripts (markdown with [mm:ss] timestamps) and the instructor's course files. Build the knowledge graph without asking questions. Do not edit anything under corpus/. When graph.json and GRAPH_REPORT.md are written, stop."
             );
+            // The session sometimes stays open after the graph is written; cap it
+            // and accept the graph if this run already wrote it.
             let cfg = AiConfig {
-                model: ai_cfg.model.clone(),
+                timeout: ai_cfg.timeout.min(GRAPH_TIMEOUT),
                 ..ai_cfg.clone()
             };
-            ai::run_agent_with_tools(
+            let started = std::time::SystemTime::now();
+            if let Err(e) = ai::run_agent_with_tools(
                 &cfg,
                 &prompt,
                 &kg,
                 "Bash,Read,Write,Edit,Glob,Grep,Agent,Skill",
-            )
-            .context("graphify via Claude Code")?;
+            ) {
+                let fresh = find_graph(run)
+                    .and_then(|g| std::fs::metadata(g).ok())
+                    .and_then(|m| m.modified().ok())
+                    .is_some_and(|t| t >= started);
+                if !fresh {
+                    return Err(e).context("graphify via Claude Code");
+                }
+            }
         }
     }
     find_graph(run)

@@ -87,7 +87,13 @@ fn fill(course: &str, chapter: &Chapter, inputs: &str, screenshots: &str, output
 
 /// Prompt for agent CLIs: inputs are staged under `.input/` in the working folder.
 /// `as_text` names the files that also have a text version in `.input/files-as-text/`.
-pub fn agent_prompt(course: &str, chapter: &Chapter, m: &Material, as_text: &[String]) -> String {
+pub fn agent_prompt(
+    course: &str,
+    chapter: &Chapter,
+    m: &Material,
+    as_text: &[String],
+    subagent_model: Option<&str>,
+) -> String {
     let mut inputs = String::from(
         "Read every file below completely before writing. They are in the current working folder.\n\nVideo transcripts:\n",
     );
@@ -114,6 +120,9 @@ pub fn agent_prompt(course: &str, chapter: &Chapter, m: &Material, as_text: &[St
     }
     if m.transcripts.len() >= PARALLEL_NOTES_MIN_VIDEOS {
         inputs.push_str(PARALLEL_NOTES);
+        if let Some(model) = subagent_model {
+            let _ = writeln!(inputs, "Start those subagents with the `{model}` model.");
+        }
     }
     let output = "Write the skill files into the current working folder (`SKILL.md`, `references/...`, screenshots in `assets/screenshots/`). Do not modify anything under `.input/`. When you are done, reply with one line: how many screenshots you kept and the files you wrote.";
     fill(course, chapter, &inputs, AGENT_SCREENSHOTS, output)
@@ -238,7 +247,17 @@ pub fn synthesize(
         let names: Vec<String> = texts.iter().map(|(n, _)| n.clone()).collect();
         let result = ai::run_agent(
             ai_cfg,
-            &with_graph(agent_prompt(course, chapter, &m, &names), graph, true),
+            &with_graph(
+                agent_prompt(
+                    course,
+                    chapter,
+                    &m,
+                    &names,
+                    ai_cfg.subagent_model.as_deref(),
+                ),
+                graph,
+                true,
+            ),
             &skill_dir,
         );
         let _ = std::fs::remove_dir_all(&stage);
@@ -516,7 +535,13 @@ mod tests {
 
     #[test]
     fn agent_prompt_points_at_staged_inputs() {
-        let p = agent_prompt("C", &chapter(), &material(), &["a.pdf".into()]);
+        let p = agent_prompt(
+            "C",
+            &chapter(),
+            &material(),
+            &["a.pdf".into()],
+            Some("sonnet"),
+        );
         assert!(p.contains("name: 05-on-page-seo"));
         assert!(p.contains(".input/transcripts/Video_01.md"));
         assert!(p.contains("assets/files/a.pdf"));

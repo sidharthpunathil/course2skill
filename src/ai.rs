@@ -56,6 +56,8 @@ pub struct AiConfig {
     pub base_url: Option<String>,
     /// An agent CLI still running after this long is stopped.
     pub timeout: Duration,
+    /// Model for subagents (Claude Code), e.g. "sonnet" while the main writer uses "opus".
+    pub subagent_model: Option<String>,
 }
 
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90 * 60);
@@ -289,6 +291,9 @@ fn run_cli(
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
+    if let (Backend::Claude, Some(m)) = (cfg.backend, &cfg.subagent_model) {
+        cmd.env("CLAUDE_CODE_SUBAGENT_MODEL", m);
+    }
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd

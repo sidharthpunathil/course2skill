@@ -281,6 +281,7 @@ impl Wizard {
             model: Some(self.model.trim().to_string()).filter(|m| !m.is_empty()),
             base_url: None,
             timeout: ai::DEFAULT_TIMEOUT,
+            subagent_model: None,
         }
     }
 

@@ -110,9 +110,12 @@ struct AiArgs {
     /// AI that groups lessons (with --layout ai) and writes the skills
     #[arg(long, value_enum, default_value_t = Backend::Claude)]
     ai: Backend,
-    /// Model for that AI (default: the tool's own default)
+    /// Model for that AI (default: the tool's own default), e.g. opus or sonnet for Claude Code
     #[arg(long)]
     ai_model: Option<String>,
+    /// Model for the subagents that write per-video lesson notes (Claude Code), e.g. sonnet
+    #[arg(long)]
+    notes_model: Option<String>,
     /// Base URL for API and local backends (e.g. http://localhost:1234/v1 for LM Studio)
     #[arg(long)]
     ai_url: Option<String>,
@@ -169,6 +172,7 @@ impl AiArgs {
             model: self.ai_model.clone(),
             base_url: self.ai_url.clone(),
             timeout: std::time::Duration::from_secs(self.skill_timeout.max(1) * 60),
+            subagent_model: self.notes_model.clone(),
         }
     }
 }
@@ -495,6 +499,7 @@ fn wizard_flow() -> Result<bool> {
         ai: AiArgs {
             ai: choice.ai.backend,
             ai_model: choice.ai.model.clone(),
+            notes_model: choice.ai.subagent_model.clone(),
             ai_url: choice.ai.base_url.clone(),
             skill_timeout: choice.ai.timeout.as_secs() / 60,
         },
